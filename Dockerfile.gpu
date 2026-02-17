@@ -1,4 +1,10 @@
-FROM nvidia/cuda:11.8.0-cudnn8-runtime-ubuntu22.04
+# Usage:
+#   docker build -f Dockerfile.gpu -t face-recognition-service:gpu .                          # default CUDA 12.6
+#   docker build -f Dockerfile.gpu --build-arg CUDA_TAG=11.8.0-cudnn8-runtime-ubuntu22.04 \
+#       --build-arg ONNXRT_VERSION=1.17.1 -t face-recognition-service:gpu-cu118 .
+
+ARG CUDA_TAG=12.6.3-cudnn-runtime-ubuntu22.04
+FROM nvidia/cuda:${CUDA_TAG}
 
 ENV PYTHONDONTWRITEBYTECODE=1
 ENV PYTHONUNBUFFERED=1
@@ -6,10 +12,13 @@ ENV FACE_USE_GPU=true
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
+        software-properties-common \
+    && add-apt-repository ppa:deadsnakes/ppa \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends \
         python3.12 python3.12-venv python3.12-dev \
         g++ \
         libglib2.0-0 \
-        curl \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
@@ -18,8 +27,13 @@ WORKDIR /app
 
 COPY pyproject.toml uv.lock ./
 RUN uv sync --frozen --no-dev --no-install-project
-# Swap onnxruntime for onnxruntime-gpu
-RUN .venv/bin/pip uninstall -y onnxruntime && .venv/bin/pip install --no-cache-dir onnxruntime-gpu>=1.16.0
+
+# Swap onnxruntime (CPU) for onnxruntime-gpu.
+# Pin version to match your CUDA toolkit — see:
+# https://onnxruntime.ai/docs/execution-providers/CUDA-ExecutionProvider.html#requirements
+ARG ONNXRT_VERSION=1.21.0
+RUN .venv/bin/pip uninstall -y onnxruntime \
+    && .venv/bin/pip install --no-cache-dir onnxruntime-gpu==${ONNXRT_VERSION}
 
 COPY src/ src/
 
