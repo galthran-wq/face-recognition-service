@@ -31,8 +31,8 @@ test-gpu:
 
 # Build GPU image. Override CUDA_TAG / ONNXRT_VERSION for different CUDA toolkits:
 #   make docker-build-gpu CUDA_TAG=11.8.0-cudnn8-runtime-ubuntu22.04 ONNXRT_VERSION=1.17.1
-CUDA_TAG ?= 12.6.3-cudnn-runtime-ubuntu22.04
-ONNXRT_VERSION ?= 1.21.0
+CUDA_TAG ?= 12.4.1-cudnn-runtime-ubuntu22.04
+ONNXRT_VERSION ?= 1.24.1
 docker-build-gpu:
 	docker build -f Dockerfile.gpu \
 		--build-arg CUDA_TAG=$(CUDA_TAG) \
