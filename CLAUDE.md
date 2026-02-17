@@ -49,6 +49,7 @@ FastAPI microservice using a layered architecture with `src/` as the root packag
 - mypy strict mode with pydantic plugin
 - Import order enforced by ruff: stdlib → third-party → local
 - Use `collections.abc` for abstract types, built-in generics (`list[str]` not `List[str]`)
+- **Always run `uv run ruff format --check src tests` after making changes** to ensure formatting is correct. Fix with `uv run ruff format src tests`.
 
 ## Testing
 

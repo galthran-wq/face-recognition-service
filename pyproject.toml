@@ -8,6 +8,10 @@ dependencies = [
     "pydantic-settings>=2.7.0",
     "structlog>=24.4.0",
     "prometheus-fastapi-instrumentator>=7.0.0",
+    "insightface>=0.7.3",
+    "numpy>=1.26,<3.0",
+    "opencv-python-headless>=4.8.0",
+    "onnxruntime>=1.16.0",
 ]
 
 [dependency-groups]
@@ -41,6 +45,7 @@ plugins = ["pydantic.mypy"]
 testpaths = ["tests"]
 pythonpath = ["."]
 asyncio_mode = "auto"
+markers = ["gpu: requires GPU and real model weights (deselect with '-m not gpu')"]
 
 [tool.coverage.run]
 source = ["src"]
