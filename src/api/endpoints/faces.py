@@ -118,6 +118,12 @@ async def _process_batch[T](
             total_faces += len(faces)
         except AppError as exc:
             results.append({"index": idx, "faces": [], "face_count": 0, "error": exc.detail})
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.exception("Batch image processing failed", index=idx)
+            error_message = str(exc) or "Processing failed"
+            results.append({"index": idx, "faces": [], "face_count": 0, "error": error_message})
 
     return results, total_faces
 

@@ -78,9 +78,20 @@ class InsightFaceProvider(FaceProvider):
             gender: str | None = None
             if sex is not None:
                 try:
-                    gender = "male" if int(sex) == 1 else "female"
+                    sex_value = int(sex)
                 except (TypeError, ValueError):
-                    gender = str(sex)
+                    if isinstance(sex, str):
+                        sex_norm = sex.strip().lower()
+                        if sex_norm in {"m", "male"}:
+                            gender = "male"
+                        elif sex_norm in {"f", "female"}:
+                            gender = "female"
+                        else:
+                            gender = sex
+                    else:
+                        gender = str(sex)
+                else:
+                    gender = "male" if sex_value == 1 else "female"
             elif getattr(f, "gender", None) is not None:
                 gender = str(f.gender)
 
