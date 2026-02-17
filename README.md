@@ -79,8 +79,23 @@ Set via environment variables or `.env` file (see `.env.example`):
 | `FACE_PROVIDER` | `insightface` | Face analysis backend |
 | `FACE_USE_GPU` | `false` | Enable GPU inference |
 | `FACE_MODEL_NAME` | `buffalo_l` | InsightFace model pack |
+| `FACE_MODEL_DIR` | `~/.insightface` | Directory for downloaded model files |
 | `FACE_DET_SIZE` | `640,640` | Detection input resolution |
 | `FACE_MAX_BATCH_SIZE` | `20` | Max images per batch request |
+
+## Model Caching
+
+By default, InsightFace downloads models on first startup. Inside Docker the model directory is `/models`. Mount a host volume to persist models across container restarts:
+
+```bash
+# CPU
+docker run -p 8000:8000 -v ~/.insightface:/models face-recognition-service
+
+# GPU
+docker run --gpus all -p 8000:8000 -v ~/.insightface:/models face-recognition-service:gpu
+```
+
+Models are downloaded once into the mounted directory and reused on subsequent runs.
 
 ## GPU Support
 

@@ -22,11 +22,13 @@ class InsightFaceProvider(FaceProvider):
         ctx_id: int = 0,
         det_size: tuple[int, int] = (640, 640),
         model_name: str = "buffalo_l",
+        model_dir: str = "~/.insightface",
     ) -> None:
         self._use_gpu = use_gpu
         self._ctx_id = ctx_id
         self._det_size = det_size
         self._model_name = model_name
+        self._model_dir = model_dir
         self._app: Any = None
 
     def load_model(self) -> None:
@@ -35,7 +37,7 @@ class InsightFaceProvider(FaceProvider):
         providers: list[str] = (
             ["CUDAExecutionProvider", "CPUExecutionProvider"] if self._use_gpu else ["CPUExecutionProvider"]
         )
-        self._app = FaceAnalysis(name=self._model_name, providers=providers)
+        self._app = FaceAnalysis(name=self._model_name, root=self._model_dir, providers=providers)
         self._app.prepare(ctx_id=self._ctx_id, det_size=self._det_size)
         self._loaded = True
 

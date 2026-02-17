@@ -122,7 +122,7 @@ class TestInsightFaceProviderLoadModel:
         provider = InsightFaceProvider(use_gpu=False, det_size=(320, 320), model_name="buffalo_l")
         provider.load_model()
 
-        mock_fa_cls.assert_called_once_with(name="buffalo_l", providers=["CPUExecutionProvider"])
+        mock_fa_cls.assert_called_once_with(name="buffalo_l", root="~/.insightface", providers=["CPUExecutionProvider"])
         mock_instance.prepare.assert_called_once_with(ctx_id=0, det_size=(320, 320))
         assert provider.is_loaded is True
 
@@ -135,7 +135,7 @@ class TestInsightFaceProviderLoadModel:
         provider.load_model()
 
         mock_fa_cls.assert_called_once_with(
-            name="buffalo_l", providers=["CUDAExecutionProvider", "CPUExecutionProvider"]
+            name="buffalo_l", root="~/.insightface", providers=["CUDAExecutionProvider", "CPUExecutionProvider"]
         )
         mock_instance.prepare.assert_called_once_with(ctx_id=1, det_size=(640, 640))
 

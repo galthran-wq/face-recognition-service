@@ -19,6 +19,7 @@ COPY --from=builder /app/.venv .venv
 COPY src/ src/
 
 ENV PATH="/app/.venv/bin:$PATH"
+ENV FACE_MODEL_DIR=/models
 
 EXPOSE 8000
 

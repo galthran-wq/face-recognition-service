@@ -19,6 +19,7 @@ class Settings(BaseSettings):
     face_ctx_id: int = 0
     face_det_size: tuple[int, int] = (640, 640)
     face_model_name: str = "buffalo_l"
+    face_model_dir: str = "~/.insightface"
     face_max_batch_size: int = 20
 
     @field_validator("face_det_size", mode="before")
