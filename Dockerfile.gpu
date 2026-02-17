@@ -1,0 +1,29 @@
+FROM nvidia/cuda:11.8.0-cudnn8-runtime-ubuntu22.04
+
+ENV PYTHONDONTWRITEBYTECODE=1
+ENV PYTHONUNBUFFERED=1
+ENV FACE_USE_GPU=true
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        python3.12 python3.12-venv python3.12-dev \
+        libglib2.0-0 \
+        curl \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
+
+WORKDIR /app
+
+COPY pyproject.toml uv.lock ./
+RUN uv sync --frozen --no-dev --no-install-project
+# Swap onnxruntime for onnxruntime-gpu
+RUN .venv/bin/pip uninstall -y onnxruntime && .venv/bin/pip install --no-cache-dir onnxruntime-gpu>=1.16.0
+
+COPY src/ src/
+
+ENV PATH="/app/.venv/bin:$PATH"
+
+EXPOSE 8000
+
+CMD ["uvicorn", "src.main:app", "--host", "0.0.0.0", "--port", "8000"]

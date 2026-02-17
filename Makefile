@@ -1,4 +1,4 @@
-.PHONY: install run test lint format pre-commit docker-build docker-run
+.PHONY: install run test test-gpu lint format pre-commit docker-build docker-run docker-build-gpu docker-run-gpu
 
 install:
 	uv sync
@@ -25,3 +25,12 @@ docker-build:
 
 docker-run:
 	docker run -p 8000:8000 python-service-template
+
+test-gpu:
+	uv run pytest -m gpu -v
+
+docker-build-gpu:
+	docker build -f Dockerfile.gpu -t face-recognition-service:gpu .
+
+docker-run-gpu:
+	docker run --gpus all -p 8000:8000 face-recognition-service:gpu

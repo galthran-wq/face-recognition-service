@@ -9,6 +9,7 @@ from src.api.router import router
 from src.config import settings
 from src.core.exceptions import register_exception_handlers
 from src.core.middleware import register_middleware
+from src.services.face_provider import create_provider
 
 logger = structlog.get_logger()
 
@@ -33,8 +34,12 @@ def configure_logging() -> None:
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     configure_logging()
-    logger.info("startup", app_name=settings.app_name)
+    provider = create_provider(settings)
+    provider.load_model()
+    app.state.face_provider = provider
+    logger.info("startup", app_name=settings.app_name, face_provider=provider.provider_name)
     yield
+    app.state.face_provider = None
     logger.info("shutdown", app_name=settings.app_name)
 
 
