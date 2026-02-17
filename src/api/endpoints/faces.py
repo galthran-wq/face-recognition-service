@@ -126,7 +126,8 @@ async def _process_batch[T](
 async def detect_batch(body: BatchRequest, provider: ProviderDep) -> DetectBatchResponse:
     results, total_faces = await _process_batch(body.images, provider.detect, _to_detect_schema)
     return DetectBatchResponse(
-        results=[DetectBatchResultItem(**r) for r in results],        total_faces=total_faces,
+        results=[DetectBatchResultItem(**r) for r in results],
+        total_faces=total_faces,
     )
 
 
@@ -134,7 +135,8 @@ async def detect_batch(body: BatchRequest, provider: ProviderDep) -> DetectBatch
 async def embed_batch(body: BatchRequest, provider: ProviderDep) -> EmbedBatchResponse:
     results, total_faces = await _process_batch(body.images, provider.embed, _to_embed_schema)
     return EmbedBatchResponse(
-        results=[EmbedBatchResultItem(**r) for r in results],        total_faces=total_faces,
+        results=[EmbedBatchResultItem(**r) for r in results],
+        total_faces=total_faces,
     )
 
 
@@ -142,5 +144,6 @@ async def embed_batch(body: BatchRequest, provider: ProviderDep) -> EmbedBatchRe
 async def analyze_batch(body: BatchRequest, provider: ProviderDep) -> AnalyzeBatchResponse:
     results, total_faces = await _process_batch(body.images, provider.analyze, _to_analyze_schema)
     return AnalyzeBatchResponse(
-        results=[AnalyzeBatchResultItem(**r) for r in results],        total_faces=total_faces,
+        results=[AnalyzeBatchResultItem(**r) for r in results],
+        total_faces=total_faces,
     )

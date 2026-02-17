@@ -117,17 +117,11 @@ class InsightFaceProvider(FaceProvider):
 
     def detect(self, image_bytes: bytes) -> list[DetectedFace]:
         faces = self._get_all_faces(image_bytes)
-        return [
-            DetectedFace(bbox=f.bbox, det_score=f.det_score)
-            for f in faces
-        ]
+        return [DetectedFace(bbox=f.bbox, det_score=f.det_score) for f in faces]
 
     def embed(self, image_bytes: bytes) -> list[DetectedFace]:
         faces = self._get_all_faces(image_bytes)
-        return [
-            DetectedFace(bbox=f.bbox, det_score=f.det_score, embedding=f.embedding)
-            for f in faces
-        ]
+        return [DetectedFace(bbox=f.bbox, det_score=f.det_score, embedding=f.embedding) for f in faces]
 
     def analyze(self, image_bytes: bytes) -> list[DetectedFace]:
         return self._get_all_faces(image_bytes)
