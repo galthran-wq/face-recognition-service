@@ -323,6 +323,153 @@ def benchmark_end_to_end_batch(
     return results
 
 
+def benchmark_batched_detection(
+    app,
+    batched_scrfd,
+    img: np.ndarray,
+    batch_sizes: list[int],
+    num_iter: int,
+    warmup: int,
+) -> tuple[list[BatchResult], list[BatchResult]]:
+    """Benchmark batched vs sequential detection across batch sizes."""
+    seq_results: list[BatchResult] = []
+    bat_results: list[BatchResult] = []
+
+    det_model = app.det_model
+    faces_in_img = len(app.get(img))
+
+    for bs in batch_sizes:
+        images = [img] * bs
+
+        # Sequential detection (current behavior)
+        timings = []
+        for i in range(warmup + num_iter):
+            t0 = time.perf_counter()
+            for im in images:
+                det_model.detect(im, max_num=0, metric="default")
+            elapsed = time.perf_counter() - t0
+            if i >= warmup:
+                timings.append(elapsed)
+
+        latency = compute_latency(timings)
+        total_time = sum(timings)
+        total_faces = faces_in_img * bs * num_iter
+        fps = total_faces / total_time if total_time > 0 else 0
+        seq_results.append(
+            BatchResult(batch_size=bs, total_faces=total_faces, total_time_s=round(total_time, 3),
+                        faces_per_sec=round(fps, 1), latency=latency)
+        )
+
+        # Batched detection
+        timings = []
+        for i in range(warmup + num_iter):
+            t0 = time.perf_counter()
+            batched_scrfd.detect_batch(images)
+            elapsed = time.perf_counter() - t0
+            if i >= warmup:
+                timings.append(elapsed)
+
+        latency = compute_latency(timings)
+        total_time = sum(timings)
+        fps = total_faces / total_time if total_time > 0 else 0
+        bat_results.append(
+            BatchResult(batch_size=bs, total_faces=total_faces, total_time_s=round(total_time, 3),
+                        faces_per_sec=round(fps, 1), latency=latency)
+        )
+
+        speedup = seq_results[-1].latency.p50_ms / bat_results[-1].latency.p50_ms if bat_results[-1].latency.p50_ms > 0 else 0
+        print(
+            f"    batch_size={bs:>3d}  |  seq p50={seq_results[-1].latency.p50_ms:.1f}ms"
+            f"  bat p50={bat_results[-1].latency.p50_ms:.1f}ms"
+            f"  speedup={speedup:.2f}x"
+        )
+
+    return seq_results, bat_results
+
+
+def benchmark_e2e_batched(
+    app,
+    batched_scrfd,
+    img: np.ndarray,
+    batch_sizes: list[int],
+    num_iter: int,
+    warmup: int,
+) -> tuple[list[BatchResult], list[BatchResult]]:
+    """End-to-end (detect+align+embed) with sequential vs batched detection."""
+    from insightface.utils import face_align  # type: ignore[import-untyped]
+
+    rec_model = app.models.get("recognition")
+    if rec_model is None:
+        return [], []
+
+    faces_in_img = len(app.get(img))
+    seq_results: list[BatchResult] = []
+    bat_results: list[BatchResult] = []
+
+    for bs in batch_sizes:
+        images = [img] * bs
+
+        # Sequential: detect one-by-one, then batch embed
+        timings = []
+        for i in range(warmup + num_iter):
+            t0 = time.perf_counter()
+            all_crops = []
+            for im in images:
+                bboxes, kpss = app.det_model.detect(im, max_num=0, metric="default")
+                if bboxes.shape[0] > 0 and kpss is not None:
+                    for kps in kpss:
+                        aimg = face_align.norm_crop(im, landmark=kps, image_size=rec_model.input_size[0])
+                        all_crops.append(aimg)
+            if all_crops:
+                rec_model.get_feat(all_crops)
+            elapsed = time.perf_counter() - t0
+            if i >= warmup:
+                timings.append(elapsed)
+
+        latency = compute_latency(timings)
+        total_time = sum(timings)
+        total_faces = faces_in_img * bs * num_iter
+        fps = total_faces / total_time if total_time > 0 else 0
+        seq_results.append(
+            BatchResult(batch_size=bs, total_faces=total_faces, total_time_s=round(total_time, 3),
+                        faces_per_sec=round(fps, 1), latency=latency)
+        )
+
+        # Batched: detect all at once, then batch embed
+        timings = []
+        for i in range(warmup + num_iter):
+            t0 = time.perf_counter()
+            detections = batched_scrfd.detect_batch(images)
+            all_crops = []
+            for b_idx, (bboxes, kpss) in enumerate(detections):
+                if bboxes.shape[0] > 0 and kpss is not None:
+                    for kps in kpss:
+                        aimg = face_align.norm_crop(images[b_idx], landmark=kps, image_size=rec_model.input_size[0])
+                        all_crops.append(aimg)
+            if all_crops:
+                rec_model.get_feat(all_crops)
+            elapsed = time.perf_counter() - t0
+            if i >= warmup:
+                timings.append(elapsed)
+
+        latency = compute_latency(timings)
+        total_time = sum(timings)
+        fps = total_faces / total_time if total_time > 0 else 0
+        bat_results.append(
+            BatchResult(batch_size=bs, total_faces=total_faces, total_time_s=round(total_time, 3),
+                        faces_per_sec=round(fps, 1), latency=latency)
+        )
+
+        speedup = seq_results[-1].latency.p50_ms / bat_results[-1].latency.p50_ms if bat_results[-1].latency.p50_ms > 0 else 0
+        print(
+            f"    batch_size={bs:>3d}  |  seq p50={seq_results[-1].latency.p50_ms:.1f}ms"
+            f"  bat p50={bat_results[-1].latency.p50_ms:.1f}ms"
+            f"  speedup={speedup:.2f}x"
+        )
+
+    return seq_results, bat_results
+
+
 # ---------------------------------------------------------------------------
 # Reporting
 # ---------------------------------------------------------------------------
@@ -387,6 +534,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--no-save", action="store_true", help="Skip saving JSON results")
     p.add_argument("--skip-single", action="store_true", help="Skip single-image benchmarks")
     p.add_argument("--skip-e2e", action="store_true", help="Skip end-to-end batch benchmarks (slow)")
+    p.add_argument(
+        "--batch-det-model",
+        type=str,
+        default="",
+        help="Path to batched SCRFD ONNX model (enables batched detection benchmark)",
+    )
     return p.parse_args()
 
 
@@ -457,6 +610,42 @@ def main() -> None:
         print("\n--- End-to-End Batch (detect + embed per image, sequential) ---")
         e2e_results = benchmark_end_to_end_batch(app, img, batch_sizes, args.num_images, args.warmup)
         print_table("End-to-End Sequential Results", e2e_results)
+
+    # --- Batched detection benchmark ---
+    if args.batch_det_model and os.path.isfile(args.batch_det_model):
+        sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+        from src.services.face_provider.batched_scrfd import BatchedSCRFD
+
+        providers = ["CUDAExecutionProvider", "CPUExecutionProvider"] if use_gpu else ["CPUExecutionProvider"]
+        batched_scrfd = BatchedSCRFD(args.batch_det_model, det_size=det_size, providers=providers)
+        print(f"\n  Loaded batched SCRFD: {args.batch_det_model}")
+
+        print("\n--- Batched Detection (sequential vs batched SCRFD) ---")
+        det_seq, det_bat = benchmark_batched_detection(
+            app, batched_scrfd, img, batch_sizes, args.num_images, args.warmup
+        )
+        print_table("Detection: Sequential (baseline)", det_seq)
+        print_table("Detection: Batched SCRFD", det_bat)
+
+        print("\n--- End-to-End Batched (detect+align+embed: sequential vs batched det) ---")
+        e2e_seq, e2e_bat = benchmark_e2e_batched(
+            app, batched_scrfd, img, batch_sizes, args.num_images, args.warmup
+        )
+        print_table("E2E: Sequential Detection", e2e_seq)
+        print_table("E2E: Batched Detection", e2e_bat)
+
+        # Summary
+        if e2e_seq and e2e_bat:
+            print(f"\n{'=' * 80}")
+            print("  BATCHED DETECTION SPEEDUP SUMMARY")
+            print(f"{'=' * 80}")
+            print(f"{'Batch':>6} | {'Seq p50':>10} | {'Bat p50':>10} | {'Speedup':>8}")
+            print("-" * 50)
+            for s, b in zip(e2e_seq, e2e_bat):
+                sp = s.latency.p50_ms / b.latency.p50_ms if b.latency.p50_ms > 0 else 0
+                print(f"{s.batch_size:>6} | {s.latency.p50_ms:>8.1f}ms | {b.latency.p50_ms:>8.1f}ms | {sp:>7.2f}x")
+    elif args.batch_det_model:
+        print(f"\n  WARNING: Batch det model not found: {args.batch_det_model}")
 
     # --- Find optimal batch size ---
     if rec_results:
