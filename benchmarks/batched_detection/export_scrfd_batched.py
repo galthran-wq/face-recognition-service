@@ -30,7 +30,7 @@ Download SCRFD_10G_KPS PyTorch weights from:
     https://1drv.ms/u/s!AswpsDO2toNKqycsF19UbaCWaLWx?e=F6i5Vm
 
 Usage:
-    python scripts/export_scrfd_batched.py \\
+    python benchmarks/batched_detection/export_scrfd_batched.py \\
         --checkpoint /path/to/scrfd_10g_kps.pth \\
         --config /tmp/insightface/detection/scrfd/configs/scrfd/scrfd_10g_bnkps.py \\
         --shape 640 \\
@@ -198,7 +198,7 @@ def export_scrfd_batched(
         ]
         print(f"  Output '{out.name}': [{', '.join(dims)}]")
 
-    print("\nDone! Validate with: python scripts/compare_det_models.py")
+    print("\nDone! Validate with: python benchmarks/batched_detection/compare_det_models.py")
 
 
 def main() -> None:

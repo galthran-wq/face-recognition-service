@@ -10,7 +10,7 @@ Checks:
 4. Batch size sweep: verify parity holds at batch=1,2,4,8,16
 
 Usage:
-    uv run python scripts/compare_det_models.py [--gpu] [--num-images 50]
+    uv run python benchmarks/batched_detection/compare_det_models.py [--gpu] [--num-images 50]
 """
 
 from __future__ import annotations
@@ -540,7 +540,7 @@ def main() -> None:
         else ["CPUExecutionProvider"]
     )
 
-    base_dir = Path(__file__).parent.parent
+    base_dir = Path(__file__).parent
     print("Downloading models...")
     model_paths = download_models(base_dir)
 
