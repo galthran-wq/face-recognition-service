@@ -135,15 +135,21 @@ because **detection is now the bottleneck**. The SCRFD detection model has a fix
 size of 1 (~14ms per image), so each image must be detected sequentially regardless. The
 recognition batching across images saves some overhead but cannot overcome the detection cost.
 
-### New bottleneck breakdown (embed, per image, 6 faces)
+### New bottleneck breakdown (embed, per image)
+
+Raw model-level timings from GPU benchmark (RTX 4090, 50 iter, 10 warmup):
 
 | Component | Time | % of pipeline |
 |-----------|------|---------------|
-| Detection (SCRFD) | ~14.5ms | 67% |
-| Batched recognition (6 faces) | ~5ms | 23% |
-| Alignment + postprocessing | ~2ms | 9% |
+| Detection (SCRFD) | ~8ms | 49% |
+| Batched recognition (9 faces) | ~3.5ms | 21% |
+| Alignment + image decode + overhead | ~5ms | 30% |
 
-Detection now dominates at 67% of pipeline time. Recognition is no longer the bottleneck.
+Total E2E (detect + align + embed): ~16.4ms per image.
+
+Detection is the largest single component but not as dominant as initially estimated.
+The earlier 14.5ms figure was endpoint-level (including image decode + Python overhead),
+not raw model time. Recognition is no longer the bottleneck thanks to batching.
 
 ### Embedding quality verification
 
@@ -151,6 +157,49 @@ Embeddings from the optimized pipeline are identical to the original `app.get()`
 - Cosine similarity: **1.000000**
 - Max absolute difference: 0.00008 (float32 precision noise)
 - Embeddings are L2-normalized to unit vectors
+
+## Round 2: Batched Detection Investigation
+
+Re-exported SCRFD 10G at 640×640 with batch-only dynamic axes (spatial fixed) to avoid
+cross-frame contamination. Model validated: zero contamination, bit-for-bit batch parity.
+
+### GPU benchmark (RTX 4090, 50 iterations, 10 warmup, 9-face image)
+
+**Detection only — sequential vs batched SCRFD:**
+
+| Batch | Sequential | Batched | Speedup |
+|-------|-----------|---------|---------|
+| 1 | 8.1ms | 7.9ms | 1.02x |
+| 2 | 16.9ms | 14.3ms | 1.18x |
+| 4 | 32.1ms | 25.8ms | 1.24x |
+| 8 | 64.8ms | 90.0ms | **0.72x** |
+| 16 | 129.5ms | 182.4ms | **0.71x** |
+| 32 | 255.9ms | 359.8ms | **0.71x** |
+
+**End-to-end (detect + align + embed) — sequential vs batched detection:**
+
+| Batch | Sequential | Batched | Speedup |
+|-------|-----------|---------|---------|
+| 1 | 16.4ms | 15.9ms | 1.03x |
+| 2 | 30.7ms | 28.3ms | 1.09x |
+| 4 | 62.4ms | 55.3ms | 1.13x |
+| 8 | 126.3ms | 146.5ms | **0.86x** |
+| 16 | 250.4ms | 295.2ms | **0.85x** |
+| 32 | 550.2ms | 636.6ms | **0.86x** |
+
+### Conclusion
+
+Batched detection provides a small win at batch 2-4 (up to 1.24x detection, 1.13x E2E) but
+is **counterproductive at batch 8+** (0.71x detection, 0.86x E2E). The large input tensor
+(`[N, 3, 640, 640]`) hits GPU memory bandwidth limits at higher batch sizes.
+
+On the RTX 4090, sequential detection is already fast at ~8ms/image. The GPU saturates its
+compute on a single 640×640 image, so stacking more images into a batch adds memory transfer
+cost without proportional compute savings.
+
+**Batched detection is kept as an optional feature** (`FACE_BATCH_DET_MODEL` env var) for
+use cases where it helps (CPU inference, weaker GPUs, batch sizes 2-4), but it is **not
+recommended for production GPU deployments** with RTX-class hardware.
 
 ## Remaining optimization opportunities
 
@@ -169,6 +218,3 @@ Embeddings from the optimized pipeline are identical to the original `app.get()`
 
 4. **Concurrent detection + recognition.** Detection for image N+1 can overlap with
    recognition for image N using CUDA streams. Would reduce batch latency by ~30%.
-
-5. **Detection model with dynamic batch.** Replace SCRFD with a detection model that supports
-   batch>1 input. This would unlock true batch-level parallelism for the detection stage.

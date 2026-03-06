@@ -21,6 +21,7 @@ class Settings(BaseSettings):
     face_model_name: str = "buffalo_l"
     face_model_dir: str = "~/.insightface"
     face_max_batch_size: int = 20
+    face_batch_det_model: str = ""
 
     @field_validator("face_det_size", mode="before")
     @classmethod

@@ -23,16 +23,24 @@ class InsightFaceProvider(FaceProvider):
         det_size: tuple[int, int] = (640, 640),
         model_name: str = "buffalo_l",
         model_dir: str = "~/.insightface",
+        batch_det_model: str = "",
     ) -> None:
         self._use_gpu = use_gpu
         self._ctx_id = ctx_id
         self._det_size = det_size
         self._model_name = model_name
         self._model_dir = model_dir
+        self._batch_det_model = batch_det_model
         self._app: Any = None
+        self._batched_scrfd: Any = None
 
     def load_model(self) -> None:
+        import os
+
+        import structlog
         from insightface.app import FaceAnalysis  # type: ignore[import-untyped]
+
+        log = structlog.get_logger()
 
         providers: list[str] = (
             ["CUDAExecutionProvider", "CPUExecutionProvider"] if self._use_gpu else ["CPUExecutionProvider"]
@@ -40,6 +48,16 @@ class InsightFaceProvider(FaceProvider):
         self._app = FaceAnalysis(name=self._model_name, root=self._model_dir, providers=providers)
         self._app.prepare(ctx_id=self._ctx_id, det_size=self._det_size)
         self._loaded = True
+
+        if self._batch_det_model and os.path.exists(self._batch_det_model):
+            from src.services.face_provider.batched_scrfd import BatchedSCRFD
+
+            self._batched_scrfd = BatchedSCRFD(
+                self._batch_det_model,
+                det_size=self._det_size,
+                providers=providers,
+            )
+            log.info("batched_scrfd_loaded", model=self._batch_det_model, det_size=self._det_size)
 
     def _decode_image(self, image_bytes: bytes) -> np.ndarray | None:
         import cv2
@@ -50,6 +68,15 @@ class InsightFaceProvider(FaceProvider):
     def _detect_faces(self, img: np.ndarray) -> tuple[np.ndarray, np.ndarray | None]:
         bboxes, kpss = self._app.det_model.detect(img, max_num=0, metric="default")
         return bboxes, kpss
+
+    def _detect_faces_batch(
+        self,
+        images: list[np.ndarray],
+    ) -> list[tuple[np.ndarray, np.ndarray | None]]:
+        if self._batched_scrfd is not None:
+            result: list[tuple[np.ndarray, np.ndarray | None]] = self._batched_scrfd.detect_batch(images)
+            return result
+        return [self._detect_faces(img) for img in images]
 
     @staticmethod
     def _make_bbox(raw_bbox: np.ndarray) -> BoundingBox:
@@ -149,18 +176,27 @@ class InsightFaceProvider(FaceProvider):
 
         rec_model = self._app.models["recognition"]
 
+        decoded: list[np.ndarray | None] = [self._decode_image(b) for b in images]
+        valid_imgs = [img for img in decoded if img is not None]
+        valid_indices = [i for i, img in enumerate(decoded) if img is not None]
+
+        detections = self._detect_faces_batch(valid_imgs) if valid_imgs else []
+
+        det_map: dict[int, tuple[np.ndarray, np.ndarray | None]] = {}
+        for j, orig_idx in enumerate(valid_indices):
+            det_map[orig_idx] = detections[j]
+
         per_image: list[tuple[np.ndarray, np.ndarray | None, np.ndarray | None]] = []
         all_crops: list[np.ndarray] = []
         crop_counts: list[int] = []
 
-        for image_bytes in images:
-            img = self._decode_image(image_bytes)
+        for i, img in enumerate(decoded):
             if img is None:
                 per_image.append((np.zeros((0, 5)), None, None))
                 crop_counts.append(0)
                 continue
 
-            bboxes, kpss = self._detect_faces(img)
+            bboxes, kpss = det_map[i]
             per_image.append((bboxes, kpss, img))
             if bboxes.shape[0] == 0 or kpss is None:
                 crop_counts.append(0)
@@ -203,18 +239,27 @@ class InsightFaceProvider(FaceProvider):
         rec_model = self._app.models["recognition"]
         ga_model = self._app.models.get("genderage")
 
+        decoded: list[np.ndarray | None] = [self._decode_image(b) for b in images]
+        valid_imgs = [img for img in decoded if img is not None]
+        valid_indices = [i for i, img in enumerate(decoded) if img is not None]
+
+        detections = self._detect_faces_batch(valid_imgs) if valid_imgs else []
+
+        det_map: dict[int, tuple[np.ndarray, np.ndarray | None]] = {}
+        for j, orig_idx in enumerate(valid_indices):
+            det_map[orig_idx] = detections[j]
+
         per_image: list[tuple[np.ndarray, np.ndarray | None, np.ndarray | None]] = []
         all_crops: list[np.ndarray] = []
         crop_counts: list[int] = []
 
-        for image_bytes in images:
-            img = self._decode_image(image_bytes)
+        for i, img in enumerate(decoded):
             if img is None:
                 per_image.append((np.zeros((0, 5)), None, None))
                 crop_counts.append(0)
                 continue
 
-            bboxes, kpss = self._detect_faces(img)
+            bboxes, kpss = det_map[i]
             per_image.append((bboxes, kpss, img))
             if bboxes.shape[0] == 0 or kpss is None:
                 crop_counts.append(0)
@@ -265,6 +310,30 @@ class InsightFaceProvider(FaceProvider):
             emb_offset += n
             results.append(faces)
 
+        return results
+
+    def detect_batch(self, images: list[bytes]) -> list[list[DetectedFace]]:
+        decoded: list[np.ndarray | None] = [self._decode_image(b) for b in images]
+        valid_imgs = [img for img in decoded if img is not None]
+        valid_indices = [i for i, img in enumerate(decoded) if img is not None]
+
+        detections = self._detect_faces_batch(valid_imgs) if valid_imgs else []
+
+        det_map: dict[int, tuple[np.ndarray, np.ndarray | None]] = {}
+        for j, orig_idx in enumerate(valid_indices):
+            det_map[orig_idx] = detections[j]
+
+        results: list[list[DetectedFace]] = []
+        for i in range(len(images)):
+            if i not in det_map:
+                results.append([])
+                continue
+            bboxes, _kpss = det_map[i]
+            faces = [
+                DetectedFace(bbox=self._make_bbox(bboxes[k, :4]), det_score=float(bboxes[k, 4]))
+                for k in range(bboxes.shape[0])
+            ]
+            results.append(faces)
         return results
 
     @property

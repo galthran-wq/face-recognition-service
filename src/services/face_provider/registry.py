@@ -19,6 +19,7 @@ def create_provider(settings: Settings) -> FaceProvider:
             det_size=settings.face_det_size,
             model_name=settings.face_model_name,
             model_dir=settings.face_model_dir,
+            batch_det_model=settings.face_batch_det_model,
         )
 
     msg = f"Unknown face provider: {name!r}"
