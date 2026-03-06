@@ -1,0 +1,244 @@
+{
+  "timestamp": "2026-03-06T10:55:27.708601+00:00",
+  "device": "GPU (CUDA)",
+  "model_name": "buffalo_l",
+  "det_size": [
+    640,
+    640
+  ],
+  "image_path": "(bundled t1.jpg)",
+  "image_resolution": [
+    1280,
+    886
+  ],
+  "num_warmup": 10,
+  "num_images": 50,
+  "faces_per_image": 6,
+  "gpu_info": null,
+  "single_image": {
+    "detect": {
+      "p50_ms": 8.52,
+      "p95_ms": 9.84,
+      "p99_ms": 10.31,
+      "mean_ms": 8.54,
+      "min_ms": 7.57,
+      "max_ms": 10.31
+    },
+    "full_pipeline": {
+      "p50_ms": 72.51,
+      "p95_ms": 94.48,
+      "p99_ms": 97.83,
+      "mean_ms": 78.11,
+      "min_ms": 67.88,
+      "max_ms": 97.83
+    },
+    "recognition_single": {
+      "p50_ms": 2.7,
+      "p95_ms": 3.58,
+      "p99_ms": 4.51,
+      "mean_ms": 2.79,
+      "min_ms": 2.29,
+      "max_ms": 4.51
+    }
+  },
+  "recognition_batch": [
+    {
+      "batch_size": 1,
+      "total_faces": 50,
+      "total_time_s": 0.155,
+      "faces_per_sec": 323.4,
+      "latency": {
+        "p50_ms": 3.05,
+        "p95_ms": 3.35,
+        "p99_ms": 3.78,
+        "mean_ms": 3.09,
+        "min_ms": 3.0,
+        "max_ms": 3.78
+      }
+    },
+    {
+      "batch_size": 2,
+      "total_faces": 100,
+      "total_time_s": 0.167,
+      "faces_per_sec": 599.9,
+      "latency": {
+        "p50_ms": 3.16,
+        "p95_ms": 4.21,
+        "p99_ms": 5.01,
+        "mean_ms": 3.33,
+        "min_ms": 3.06,
+        "max_ms": 5.01
+      }
+    },
+    {
+      "batch_size": 4,
+      "total_faces": 200,
+      "total_time_s": 0.195,
+      "faces_per_sec": 1024.8,
+      "latency": {
+        "p50_ms": 3.67,
+        "p95_ms": 5.26,
+        "p99_ms": 6.66,
+        "mean_ms": 3.9,
+        "min_ms": 3.22,
+        "max_ms": 6.66
+      }
+    },
+    {
+      "batch_size": 8,
+      "total_faces": 400,
+      "total_time_s": 0.197,
+      "faces_per_sec": 2034.4,
+      "latency": {
+        "p50_ms": 3.63,
+        "p95_ms": 4.61,
+        "p99_ms": 10.79,
+        "mean_ms": 3.93,
+        "min_ms": 3.55,
+        "max_ms": 10.79
+      }
+    },
+    {
+      "batch_size": 16,
+      "total_faces": 800,
+      "total_time_s": 0.307,
+      "faces_per_sec": 2606.1,
+      "latency": {
+        "p50_ms": 6.1,
+        "p95_ms": 6.54,
+        "p99_ms": 6.81,
+        "mean_ms": 6.14,
+        "min_ms": 6.04,
+        "max_ms": 6.81
+      }
+    },
+    {
+      "batch_size": 32,
+      "total_faces": 1600,
+      "total_time_s": 0.598,
+      "faces_per_sec": 2674.6,
+      "latency": {
+        "p50_ms": 11.83,
+        "p95_ms": 12.8,
+        "p99_ms": 12.93,
+        "mean_ms": 11.96,
+        "min_ms": 11.67,
+        "max_ms": 12.93
+      }
+    },
+    {
+      "batch_size": 64,
+      "total_faces": 3200,
+      "total_time_s": 1.248,
+      "faces_per_sec": 2564.1,
+      "latency": {
+        "p50_ms": 24.69,
+        "p95_ms": 27.9,
+        "p99_ms": 28.2,
+        "mean_ms": 24.96,
+        "min_ms": 24.39,
+        "max_ms": 28.2
+      }
+    }
+  ],
+  "end_to_end_batch": [
+    {
+      "batch_size": 1,
+      "total_faces": 300,
+      "total_time_s": 3.862,
+      "faces_per_sec": 77.7,
+      "latency": {
+        "p50_ms": 75.22,
+        "p95_ms": 92.16,
+        "p99_ms": 95.04,
+        "mean_ms": 77.24,
+        "min_ms": 66.99,
+        "max_ms": 95.04
+      }
+    },
+    {
+      "batch_size": 2,
+      "total_faces": 600,
+      "total_time_s": 7.718,
+      "faces_per_sec": 77.7,
+      "latency": {
+        "p50_ms": 147.9,
+        "p95_ms": 182.1,
+        "p99_ms": 195.09,
+        "mean_ms": 154.36,
+        "min_ms": 138.67,
+        "max_ms": 195.09
+      }
+    },
+    {
+      "batch_size": 4,
+      "total_faces": 1200,
+      "total_time_s": 15.859,
+      "faces_per_sec": 75.7,
+      "latency": {
+        "p50_ms": 306.79,
+        "p95_ms": 384.55,
+        "p99_ms": 416.79,
+        "mean_ms": 317.19,
+        "min_ms": 277.53,
+        "max_ms": 416.79
+      }
+    },
+    {
+      "batch_size": 8,
+      "total_faces": 2400,
+      "total_time_s": 30.83,
+      "faces_per_sec": 77.8,
+      "latency": {
+        "p50_ms": 603.84,
+        "p95_ms": 739.99,
+        "p99_ms": 764.01,
+        "mean_ms": 616.6,
+        "min_ms": 541.13,
+        "max_ms": 764.01
+      }
+    },
+    {
+      "batch_size": 16,
+      "total_faces": 4800,
+      "total_time_s": 60.736,
+      "faces_per_sec": 79.0,
+      "latency": {
+        "p50_ms": 1209.89,
+        "p95_ms": 1319.76,
+        "p99_ms": 1323.0,
+        "mean_ms": 1214.73,
+        "min_ms": 1117.19,
+        "max_ms": 1323.0
+      }
+    },
+    {
+      "batch_size": 32,
+      "total_faces": 9600,
+      "total_time_s": 123.092,
+      "faces_per_sec": 78.0,
+      "latency": {
+        "p50_ms": 2466.19,
+        "p95_ms": 2664.41,
+        "p99_ms": 2868.68,
+        "mean_ms": 2461.84,
+        "min_ms": 2255.45,
+        "max_ms": 2868.68
+      }
+    },
+    {
+      "batch_size": 64,
+      "total_faces": 19200,
+      "total_time_s": 245.787,
+      "faces_per_sec": 78.1,
+      "latency": {
+        "p50_ms": 4864.24,
+        "p95_ms": 5492.47,
+        "p99_ms": 5899.99,
+        "mean_ms": 4915.74,
+        "min_ms": 4491.0,
+        "max_ms": 5899.99
+      }
+    }
+  ]
+}

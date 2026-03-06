@@ -40,6 +40,18 @@ class FaceProvider(ABC):
     def analyze(self, image_bytes: bytes) -> list[DetectedFace]:
         """Return faces with bounding boxes + embeddings + demographics."""
 
+    def detect_batch(self, images: list[bytes]) -> list[list[DetectedFace]]:
+        """Process multiple images. Default: sequential calls to detect()."""
+        return [self.detect(img) for img in images]
+
+    def embed_batch(self, images: list[bytes]) -> list[list[DetectedFace]]:
+        """Process multiple images with cross-image batched recognition."""
+        return [self.embed(img) for img in images]
+
+    def analyze_batch(self, images: list[bytes]) -> list[list[DetectedFace]]:
+        """Process multiple images with cross-image batched recognition + attributes."""
+        return [self.analyze(img) for img in images]
+
     @property
     @abstractmethod
     def provider_name(self) -> str: ...

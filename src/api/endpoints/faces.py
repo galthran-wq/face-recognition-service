@@ -105,25 +105,35 @@ async def _process_batch[T](
     if len(images) > settings.face_max_batch_size:
         raise AppError(400, f"Batch size {len(images)} exceeds maximum of {settings.face_max_batch_size}")
 
-    results: list[dict[str, object]] = []
-    total_faces = 0
-
+    # Decode all images upfront (no GPU needed)
+    decoded: list[tuple[int, bytes | None, str | None]] = []
     for idx, item in enumerate(images):
         try:
             image_bytes = _decode_base64(item.image_b64)
-            async with _inference_sem:
-                faces = await asyncio.to_thread(method, image_bytes)
-            face_schemas = [to_schema(f) for f in faces]
-            results.append({"index": idx, "faces": face_schemas, "face_count": len(faces), "error": None})
-            total_faces += len(faces)
+            decoded.append((idx, image_bytes, None))
         except AppError as exc:
-            results.append({"index": idx, "faces": [], "face_count": 0, "error": exc.detail})
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:
-            logger.exception("Batch image processing failed", index=idx)
-            error_message = str(exc) or "Processing failed"
-            results.append({"index": idx, "faces": [], "face_count": 0, "error": error_message})
+            decoded.append((idx, None, exc.detail))
+
+    results: list[dict[str, object]] = []
+    total_faces = 0
+
+    # Acquire semaphore once for the entire batch
+    async with _inference_sem:
+        for idx, image_bytes, error in decoded:
+            if error is not None:
+                results.append({"index": idx, "faces": [], "face_count": 0, "error": error})
+                continue
+            try:
+                faces = await asyncio.to_thread(method, image_bytes)
+                face_schemas = [to_schema(f) for f in faces]
+                results.append({"index": idx, "faces": face_schemas, "face_count": len(faces), "error": None})
+                total_faces += len(faces)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.exception("Batch image processing failed", index=idx)
+                error_message = str(exc) or "Processing failed"
+                results.append({"index": idx, "faces": [], "face_count": 0, "error": error_message})
 
     return results, total_faces
 
@@ -137,9 +147,55 @@ async def detect_batch(body: BatchRequest, provider: ProviderDep) -> DetectBatch
     )
 
 
+async def _process_batch_optimized[T](
+    images: list[ImageRequest],
+    batch_method: Callable[[list[bytes]], list[list[DetectedFace]]],
+    to_schema: Callable[[DetectedFace], T],
+) -> tuple[list[dict[str, object]], int]:
+    """Process batch using provider's cross-image batched method."""
+    if len(images) > settings.face_max_batch_size:
+        raise AppError(400, f"Batch size {len(images)} exceeds maximum of {settings.face_max_batch_size}")
+
+    # Decode all images upfront
+    valid_indices: list[int] = []
+    valid_bytes: list[bytes] = []
+    results: list[dict[str, object]] = [{}] * len(images)
+
+    for idx, item in enumerate(images):
+        try:
+            image_bytes = _decode_base64(item.image_b64)
+            valid_indices.append(idx)
+            valid_bytes.append(image_bytes)
+        except AppError as exc:
+            results[idx] = {"index": idx, "faces": [], "face_count": 0, "error": exc.detail}
+
+    total_faces = 0
+
+    if valid_bytes:
+        async with _inference_sem:
+            try:
+                all_faces = await asyncio.to_thread(batch_method, valid_bytes)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.exception("Batch processing failed")
+                error_message = str(exc) or "Processing failed"
+                for idx in valid_indices:
+                    results[idx] = {"index": idx, "faces": [], "face_count": 0, "error": error_message}
+                return results, 0
+
+        for i, idx in enumerate(valid_indices):
+            faces = all_faces[i]
+            face_schemas = [to_schema(f) for f in faces]
+            results[idx] = {"index": idx, "faces": face_schemas, "face_count": len(faces), "error": None}
+            total_faces += len(faces)
+
+    return results, total_faces
+
+
 @router.post("/embed/batch")
 async def embed_batch(body: BatchRequest, provider: ProviderDep) -> EmbedBatchResponse:
-    results, total_faces = await _process_batch(body.images, provider.embed, _to_embed_schema)
+    results, total_faces = await _process_batch_optimized(body.images, provider.embed_batch, _to_embed_schema)
     return EmbedBatchResponse(
         results=[EmbedBatchResultItem(**r) for r in results],
         total_faces=total_faces,
@@ -148,7 +204,7 @@ async def embed_batch(body: BatchRequest, provider: ProviderDep) -> EmbedBatchRe
 
 @router.post("/analyze/batch")
 async def analyze_batch(body: BatchRequest, provider: ProviderDep) -> AnalyzeBatchResponse:
-    results, total_faces = await _process_batch(body.images, provider.analyze, _to_analyze_schema)
+    results, total_faces = await _process_batch_optimized(body.images, provider.analyze_batch, _to_analyze_schema)
     return AnalyzeBatchResponse(
         results=[AnalyzeBatchResultItem(**r) for r in results],
         total_faces=total_faces,
