@@ -67,9 +67,6 @@ def _to_analyze_schema(face: DetectedFace) -> AnalyzeFaceSchema:
     )
 
 
-# --- Single endpoints ---
-
-
 @router.post("/detect")
 async def detect(body: ImageRequest, provider: ProviderDep) -> DetectResponse:
     image_bytes = _decode_base64(body.image_b64)
@@ -94,9 +91,6 @@ async def analyze(body: ImageRequest, provider: ProviderDep) -> AnalyzeResponse:
     return AnalyzeResponse(faces=[_to_analyze_schema(f) for f in faces], face_count=len(faces))
 
 
-# --- Batch endpoints ---
-
-
 async def _process_batch[T](
     images: list[ImageRequest],
     method: Callable[[bytes], list[DetectedFace]],
@@ -105,7 +99,6 @@ async def _process_batch[T](
     if len(images) > settings.face_max_batch_size:
         raise AppError(400, f"Batch size {len(images)} exceeds maximum of {settings.face_max_batch_size}")
 
-    # Decode all images upfront (no GPU needed)
     decoded: list[tuple[int, bytes | None, str | None]] = []
     for idx, item in enumerate(images):
         try:
@@ -117,7 +110,6 @@ async def _process_batch[T](
     results: list[dict[str, object]] = []
     total_faces = 0
 
-    # Acquire semaphore once for the entire batch
     async with _inference_sem:
         for idx, image_bytes, error in decoded:
             if error is not None:
@@ -152,11 +144,9 @@ async def _process_batch_optimized[T](
     batch_method: Callable[[list[bytes]], list[list[DetectedFace]]],
     to_schema: Callable[[DetectedFace], T],
 ) -> tuple[list[dict[str, object]], int]:
-    """Process batch using provider's cross-image batched method."""
     if len(images) > settings.face_max_batch_size:
         raise AppError(400, f"Batch size {len(images)} exceeds maximum of {settings.face_max_batch_size}")
 
-    # Decode all images upfront
     valid_indices: list[int] = []
     valid_bytes: list[bytes] = []
     results: list[dict[str, object]] = [{}] * len(images)

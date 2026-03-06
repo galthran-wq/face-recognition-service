@@ -41,10 +41,6 @@ class InsightFaceProvider(FaceProvider):
         self._app.prepare(ctx_id=self._ctx_id, det_size=self._det_size)
         self._loaded = True
 
-    # ------------------------------------------------------------------
-    # Internal helpers
-    # ------------------------------------------------------------------
-
     def _decode_image(self, image_bytes: bytes) -> np.ndarray | None:
         import cv2
 
@@ -52,7 +48,6 @@ class InsightFaceProvider(FaceProvider):
         return cv2.imdecode(arr, cv2.IMREAD_COLOR)
 
     def _detect_faces(self, img: np.ndarray) -> tuple[np.ndarray, np.ndarray | None]:
-        """Run detection model only. Returns (bboxes_with_scores, keypoints)."""
         bboxes, kpss = self._app.det_model.detect(img, max_num=0, metric="default")
         return bboxes, kpss
 
@@ -62,7 +57,6 @@ class InsightFaceProvider(FaceProvider):
         return BoundingBox(x=x1, y=y1, width=max(0.0, x2 - x1), height=max(0.0, y2 - y1))
 
     def _align_and_embed(self, img: np.ndarray, kpss: np.ndarray) -> np.ndarray:
-        """Align all faces and run batched recognition. Returns (N, 512) embeddings."""
         from insightface.utils import face_align  # type: ignore[import-untyped]
 
         rec_model = self._app.models["recognition"]
@@ -71,14 +65,9 @@ class InsightFaceProvider(FaceProvider):
             aimg = face_align.norm_crop(img, landmark=kps, image_size=rec_model.input_size[0])
             crops.append(aimg)
         embeddings: np.ndarray = rec_model.get_feat(crops)
-        # Normalize to unit vectors (match normed_embedding from app.get())
         norms = np.linalg.norm(embeddings, axis=1, keepdims=True)
         norms = np.maximum(norms, 1e-10)
         return embeddings / norms
-
-    # ------------------------------------------------------------------
-    # Public API
-    # ------------------------------------------------------------------
 
     def detect(self, image_bytes: bytes) -> list[DetectedFace]:
         img = self._decode_image(image_bytes)
@@ -123,10 +112,7 @@ class InsightFaceProvider(FaceProvider):
         if bboxes.shape[0] == 0:
             return []
 
-        # Batched recognition
         embeddings = self._align_and_embed(img, kpss)
-
-        # Genderage per-face (uses bbox-based crop internally)
         ga_model = self._app.models.get("genderage")
 
         results: list[DetectedFace] = []
@@ -135,7 +121,6 @@ class InsightFaceProvider(FaceProvider):
             gender: str | None = None
 
             if ga_model is not None:
-                # Build a minimal Face-like object for genderage model
                 face_obj = _FaceProxy(bbox=bboxes[i, :4], kps=kpss[i] if kpss is not None else None)
                 ga_model.get(img, face_obj)
                 age = _to_float(face_obj.get("age"))
@@ -158,16 +143,11 @@ class InsightFaceProvider(FaceProvider):
 
         return results
 
-    # ------------------------------------------------------------------
-    # Batch API — cross-image batched recognition
-    # ------------------------------------------------------------------
-
     def embed_batch(self, images: list[bytes]) -> list[list[DetectedFace]]:
         from insightface.utils import face_align  # type: ignore[import-untyped]
 
         rec_model = self._app.models["recognition"]
 
-        # Phase 1: detect all images, collect aligned crops
         per_image: list[tuple[np.ndarray, np.ndarray | None, np.ndarray | None]] = []
         all_crops: list[np.ndarray] = []
         crop_counts: list[int] = []
@@ -190,7 +170,6 @@ class InsightFaceProvider(FaceProvider):
                 all_crops.append(aimg)
             crop_counts.append(bboxes.shape[0])
 
-        # Phase 2: single batched recognition call for ALL faces across ALL images
         if all_crops:
             all_embeddings: np.ndarray = rec_model.get_feat(all_crops)
             norms = np.linalg.norm(all_embeddings, axis=1, keepdims=True)
@@ -199,7 +178,6 @@ class InsightFaceProvider(FaceProvider):
         else:
             all_embeddings = np.zeros((0, 512), dtype=np.float32)
 
-        # Phase 3: distribute embeddings back to per-image results
         results: list[list[DetectedFace]] = []
         emb_offset = 0
         for idx, (bboxes, _kpss, _img) in enumerate(per_image):
@@ -224,7 +202,6 @@ class InsightFaceProvider(FaceProvider):
         rec_model = self._app.models["recognition"]
         ga_model = self._app.models.get("genderage")
 
-        # Phase 1: detect all images, collect aligned crops
         per_image: list[tuple[np.ndarray, np.ndarray | None, np.ndarray | None]] = []
         all_crops: list[np.ndarray] = []
         crop_counts: list[int] = []
@@ -247,7 +224,6 @@ class InsightFaceProvider(FaceProvider):
                 all_crops.append(aimg)
             crop_counts.append(bboxes.shape[0])
 
-        # Phase 2: single batched recognition call
         if all_crops:
             all_embeddings: np.ndarray = rec_model.get_feat(all_crops)
             norms = np.linalg.norm(all_embeddings, axis=1, keepdims=True)
@@ -256,7 +232,6 @@ class InsightFaceProvider(FaceProvider):
         else:
             all_embeddings = np.zeros((0, 512), dtype=np.float32)
 
-        # Phase 3: distribute embeddings + run genderage per face
         results: list[list[DetectedFace]] = []
         emb_offset = 0
         for idx, (bboxes, kpss, img) in enumerate(per_image):
@@ -297,8 +272,6 @@ class InsightFaceProvider(FaceProvider):
 
 
 class _FaceProxy:
-    """Minimal Face-like object that genderage model can write attributes to."""
-
     def __init__(self, bbox: np.ndarray, kps: np.ndarray | None) -> None:
         self.bbox = bbox
         self.kps = kps
