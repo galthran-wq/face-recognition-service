@@ -67,7 +67,8 @@ class InsightFaceProvider(FaceProvider):
         embeddings: np.ndarray = rec_model.get_feat(crops)
         norms = np.linalg.norm(embeddings, axis=1, keepdims=True)
         norms = np.maximum(norms, 1e-10)
-        return embeddings / norms
+        normalized: np.ndarray = embeddings / norms
+        return normalized
 
     def detect(self, image_bytes: bytes) -> list[DetectedFace]:
         img = self._decode_image(image_bytes)
@@ -89,7 +90,7 @@ class InsightFaceProvider(FaceProvider):
             return []
 
         bboxes, kpss = self._detect_faces(img)
-        if bboxes.shape[0] == 0:
+        if bboxes.shape[0] == 0 or kpss is None:
             return []
 
         embeddings = self._align_and_embed(img, kpss)
@@ -109,7 +110,7 @@ class InsightFaceProvider(FaceProvider):
             return []
 
         bboxes, kpss = self._detect_faces(img)
-        if bboxes.shape[0] == 0:
+        if bboxes.shape[0] == 0 or kpss is None:
             return []
 
         embeddings = self._align_and_embed(img, kpss)
@@ -127,7 +128,7 @@ class InsightFaceProvider(FaceProvider):
                 gender_val = face_obj.get("gender")
                 if gender_val is not None:
                     try:
-                        gender = "male" if int(gender_val) == 1 else "female"
+                        gender = "male" if int(gender_val) == 1 else "female"  # type: ignore[call-overload]
                     except (TypeError, ValueError):
                         gender = str(gender_val)
 
@@ -144,7 +145,7 @@ class InsightFaceProvider(FaceProvider):
         return results
 
     def embed_batch(self, images: list[bytes]) -> list[list[DetectedFace]]:
-        from insightface.utils import face_align  # type: ignore[import-untyped]
+        from insightface.utils import face_align
 
         rec_model = self._app.models["recognition"]
 
@@ -197,7 +198,7 @@ class InsightFaceProvider(FaceProvider):
         return results
 
     def analyze_batch(self, images: list[bytes]) -> list[list[DetectedFace]]:
-        from insightface.utils import face_align  # type: ignore[import-untyped]
+        from insightface.utils import face_align
 
         rec_model = self._app.models["recognition"]
         ga_model = self._app.models.get("genderage")
@@ -248,7 +249,7 @@ class InsightFaceProvider(FaceProvider):
                     gender_val = face_obj.get("gender")
                     if gender_val is not None:
                         try:
-                            gender = "male" if int(gender_val) == 1 else "female"
+                            gender = "male" if int(gender_val) == 1 else "female"  # type: ignore[call-overload]
                         except (TypeError, ValueError):
                             gender = str(gender_val)
 

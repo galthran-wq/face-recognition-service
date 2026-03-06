@@ -111,12 +111,13 @@ async def _process_batch[T](
     total_faces = 0
 
     async with _inference_sem:
-        for idx, image_bytes, error in decoded:
+        for idx, raw_bytes, error in decoded:
             if error is not None:
                 results.append({"index": idx, "faces": [], "face_count": 0, "error": error})
                 continue
+            assert raw_bytes is not None
             try:
-                faces = await asyncio.to_thread(method, image_bytes)
+                faces = await asyncio.to_thread(method, raw_bytes)
                 face_schemas = [to_schema(f) for f in faces]
                 results.append({"index": idx, "faces": face_schemas, "face_count": len(faces), "error": None})
                 total_faces += len(faces)
