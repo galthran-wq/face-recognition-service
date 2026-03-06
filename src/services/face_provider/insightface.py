@@ -41,104 +41,248 @@ class InsightFaceProvider(FaceProvider):
         self._app.prepare(ctx_id=self._ctx_id, det_size=self._det_size)
         self._loaded = True
 
-    def _get_all_faces(self, image_bytes: bytes) -> list[DetectedFace]:
+    def _decode_image(self, image_bytes: bytes) -> np.ndarray | None:
         import cv2
 
         arr = np.frombuffer(image_bytes, dtype=np.uint8)
-        img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+        return cv2.imdecode(arr, cv2.IMREAD_COLOR)
+
+    def _detect_faces(self, img: np.ndarray) -> tuple[np.ndarray, np.ndarray | None]:
+        bboxes, kpss = self._app.det_model.detect(img, max_num=0, metric="default")
+        return bboxes, kpss
+
+    @staticmethod
+    def _make_bbox(raw_bbox: np.ndarray) -> BoundingBox:
+        x1, y1, x2, y2 = (float(v) for v in raw_bbox[:4])
+        return BoundingBox(x=x1, y=y1, width=max(0.0, x2 - x1), height=max(0.0, y2 - y1))
+
+    def _align_and_embed(self, img: np.ndarray, kpss: np.ndarray) -> np.ndarray:
+        from insightface.utils import face_align  # type: ignore[import-untyped]
+
+        rec_model = self._app.models["recognition"]
+        crops = []
+        for kps in kpss:
+            aimg = face_align.norm_crop(img, landmark=kps, image_size=rec_model.input_size[0])
+            crops.append(aimg)
+        embeddings: np.ndarray = rec_model.get_feat(crops)
+        norms = np.linalg.norm(embeddings, axis=1, keepdims=True)
+        norms = np.maximum(norms, 1e-10)
+        normalized: np.ndarray = embeddings / norms
+        return normalized
+
+    def detect(self, image_bytes: bytes) -> list[DetectedFace]:
+        img = self._decode_image(image_bytes)
         if img is None:
             return []
 
-        raw_faces: list[Any] = self._app.get(img)
-        result: list[DetectedFace] = []
-        for f in raw_faces:
-            # Embedding
-            emb = getattr(f, "normed_embedding", None)
-            if emb is None:
-                emb = getattr(f, "embedding", None)
-            embedding: list[float] | None = None
-            if isinstance(emb, np.ndarray):
-                embedding = emb.astype(np.float32).tolist()
-            elif hasattr(emb, "tolist"):
-                embedding = emb.tolist()  # type: ignore[union-attr]
-            elif isinstance(emb, (list, tuple)):
-                embedding = [float(v) for v in emb]
+        bboxes, _kpss = self._detect_faces(img)
+        if bboxes.shape[0] == 0:
+            return []
 
-            # Bounding box: [x1, y1, x2, y2] -> {x, y, width, height}
-            raw_bbox = getattr(f, "bbox", None)
-            if raw_bbox is not None:
-                x1, y1, x2, y2 = (float(v) for v in raw_bbox[:4])
-                bbox = BoundingBox(x=x1, y=y1, width=max(0.0, x2 - x1), height=max(0.0, y2 - y1))
-            else:
-                bbox = BoundingBox(x=0.0, y=0.0, width=0.0, height=0.0)
-
-            # Age
-            age = _to_float(getattr(f, "age", None))
-
-            # Gender
-            sex = getattr(f, "sex", None)
-            gender: str | None = None
-            if sex is not None:
-                try:
-                    sex_value = int(sex)
-                except (TypeError, ValueError):
-                    if isinstance(sex, str):
-                        sex_norm = sex.strip().lower()
-                        if sex_norm in {"m", "male"}:
-                            gender = "male"
-                        elif sex_norm in {"f", "female"}:
-                            gender = "female"
-                        else:
-                            gender = sex
-                    else:
-                        gender = str(sex)
-                else:
-                    gender = "male" if sex_value == 1 else "female"
-            elif getattr(f, "gender", None) is not None:
-                gender = str(f.gender)
-
-            # Detection score
-            det_score = _to_float(getattr(f, "det_score", None)) or 0.0
-
-            # Race
-            race: str | None = None
-            if hasattr(f, "race"):
-                race_val = f.race
-                race = str(race_val) if race_val is not None else None
-
-            race_probs: dict[str, float] | None = None
-            for attr in ("races", "race_probs", "race_prob"):
-                if hasattr(f, attr) and race_probs is None:
-                    rp = getattr(f, attr)
-                    if isinstance(rp, dict):
-                        race_probs = {str(k): float(v) for k, v in rp.items()}
-                    elif isinstance(rp, (list, tuple)):
-                        race_probs = {str(i): float(v) for i, v in enumerate(rp)}
-
-            result.append(
-                DetectedFace(
-                    bbox=bbox,
-                    det_score=det_score,
-                    embedding=embedding,
-                    age=age,
-                    gender=gender,
-                    race=race,
-                    race_probs=race_probs,
-                )
-            )
-        return result
-
-    def detect(self, image_bytes: bytes) -> list[DetectedFace]:
-        faces = self._get_all_faces(image_bytes)
-        return [DetectedFace(bbox=f.bbox, det_score=f.det_score) for f in faces]
+        return [
+            DetectedFace(bbox=self._make_bbox(bboxes[i, :4]), det_score=float(bboxes[i, 4]))
+            for i in range(bboxes.shape[0])
+        ]
 
     def embed(self, image_bytes: bytes) -> list[DetectedFace]:
-        faces = self._get_all_faces(image_bytes)
-        return [DetectedFace(bbox=f.bbox, det_score=f.det_score, embedding=f.embedding) for f in faces]
+        img = self._decode_image(image_bytes)
+        if img is None:
+            return []
+
+        bboxes, kpss = self._detect_faces(img)
+        if bboxes.shape[0] == 0 or kpss is None:
+            return []
+
+        embeddings = self._align_and_embed(img, kpss)
+
+        return [
+            DetectedFace(
+                bbox=self._make_bbox(bboxes[i, :4]),
+                det_score=float(bboxes[i, 4]),
+                embedding=embeddings[i].astype(np.float32).tolist(),
+            )
+            for i in range(bboxes.shape[0])
+        ]
 
     def analyze(self, image_bytes: bytes) -> list[DetectedFace]:
-        return self._get_all_faces(image_bytes)
+        img = self._decode_image(image_bytes)
+        if img is None:
+            return []
+
+        bboxes, kpss = self._detect_faces(img)
+        if bboxes.shape[0] == 0 or kpss is None:
+            return []
+
+        embeddings = self._align_and_embed(img, kpss)
+        ga_model = self._app.models.get("genderage")
+
+        results: list[DetectedFace] = []
+        for i in range(bboxes.shape[0]):
+            age: float | None = None
+            gender: str | None = None
+
+            if ga_model is not None:
+                face_obj = _FaceProxy(bbox=bboxes[i, :4], kps=kpss[i] if kpss is not None else None)
+                ga_model.get(img, face_obj)
+                age = _to_float(face_obj.get("age"))
+                gender_val = face_obj.get("gender")
+                if gender_val is not None:
+                    try:
+                        gender = "male" if int(gender_val) == 1 else "female"  # type: ignore[call-overload]
+                    except (TypeError, ValueError):
+                        gender = str(gender_val)
+
+            results.append(
+                DetectedFace(
+                    bbox=self._make_bbox(bboxes[i, :4]),
+                    det_score=float(bboxes[i, 4]),
+                    embedding=embeddings[i].astype(np.float32).tolist(),
+                    age=age,
+                    gender=gender,
+                )
+            )
+
+        return results
+
+    def embed_batch(self, images: list[bytes]) -> list[list[DetectedFace]]:
+        from insightface.utils import face_align
+
+        rec_model = self._app.models["recognition"]
+
+        per_image: list[tuple[np.ndarray, np.ndarray | None, np.ndarray | None]] = []
+        all_crops: list[np.ndarray] = []
+        crop_counts: list[int] = []
+
+        for image_bytes in images:
+            img = self._decode_image(image_bytes)
+            if img is None:
+                per_image.append((np.zeros((0, 5)), None, None))
+                crop_counts.append(0)
+                continue
+
+            bboxes, kpss = self._detect_faces(img)
+            per_image.append((bboxes, kpss, img))
+            if bboxes.shape[0] == 0 or kpss is None:
+                crop_counts.append(0)
+                continue
+
+            for kps in kpss:
+                aimg = face_align.norm_crop(img, landmark=kps, image_size=rec_model.input_size[0])
+                all_crops.append(aimg)
+            crop_counts.append(bboxes.shape[0])
+
+        if all_crops:
+            all_embeddings: np.ndarray = rec_model.get_feat(all_crops)
+            norms = np.linalg.norm(all_embeddings, axis=1, keepdims=True)
+            norms = np.maximum(norms, 1e-10)
+            all_embeddings = all_embeddings / norms
+        else:
+            all_embeddings = np.zeros((0, 512), dtype=np.float32)
+
+        results: list[list[DetectedFace]] = []
+        emb_offset = 0
+        for idx, (bboxes, _kpss, _img) in enumerate(per_image):
+            n = crop_counts[idx]
+            faces: list[DetectedFace] = []
+            for i in range(n):
+                faces.append(
+                    DetectedFace(
+                        bbox=self._make_bbox(bboxes[i, :4]),
+                        det_score=float(bboxes[i, 4]),
+                        embedding=all_embeddings[emb_offset + i].astype(np.float32).tolist(),
+                    )
+                )
+            emb_offset += n
+            results.append(faces)
+
+        return results
+
+    def analyze_batch(self, images: list[bytes]) -> list[list[DetectedFace]]:
+        from insightface.utils import face_align
+
+        rec_model = self._app.models["recognition"]
+        ga_model = self._app.models.get("genderage")
+
+        per_image: list[tuple[np.ndarray, np.ndarray | None, np.ndarray | None]] = []
+        all_crops: list[np.ndarray] = []
+        crop_counts: list[int] = []
+
+        for image_bytes in images:
+            img = self._decode_image(image_bytes)
+            if img is None:
+                per_image.append((np.zeros((0, 5)), None, None))
+                crop_counts.append(0)
+                continue
+
+            bboxes, kpss = self._detect_faces(img)
+            per_image.append((bboxes, kpss, img))
+            if bboxes.shape[0] == 0 or kpss is None:
+                crop_counts.append(0)
+                continue
+
+            for kps in kpss:
+                aimg = face_align.norm_crop(img, landmark=kps, image_size=rec_model.input_size[0])
+                all_crops.append(aimg)
+            crop_counts.append(bboxes.shape[0])
+
+        if all_crops:
+            all_embeddings: np.ndarray = rec_model.get_feat(all_crops)
+            norms = np.linalg.norm(all_embeddings, axis=1, keepdims=True)
+            norms = np.maximum(norms, 1e-10)
+            all_embeddings = all_embeddings / norms
+        else:
+            all_embeddings = np.zeros((0, 512), dtype=np.float32)
+
+        results: list[list[DetectedFace]] = []
+        emb_offset = 0
+        for idx, (bboxes, kpss, img) in enumerate(per_image):
+            n = crop_counts[idx]
+            faces: list[DetectedFace] = []
+            for i in range(n):
+                age: float | None = None
+                gender: str | None = None
+
+                if ga_model is not None and img is not None and kpss is not None:
+                    face_obj = _FaceProxy(bbox=bboxes[i, :4], kps=kpss[i])
+                    ga_model.get(img, face_obj)
+                    age = _to_float(face_obj.get("age"))
+                    gender_val = face_obj.get("gender")
+                    if gender_val is not None:
+                        try:
+                            gender = "male" if int(gender_val) == 1 else "female"  # type: ignore[call-overload]
+                        except (TypeError, ValueError):
+                            gender = str(gender_val)
+
+                faces.append(
+                    DetectedFace(
+                        bbox=self._make_bbox(bboxes[i, :4]),
+                        det_score=float(bboxes[i, 4]),
+                        embedding=all_embeddings[emb_offset + i].astype(np.float32).tolist(),
+                        age=age,
+                        gender=gender,
+                    )
+                )
+            emb_offset += n
+            results.append(faces)
+
+        return results
 
     @property
     def provider_name(self) -> str:
         return "insightface"
+
+
+class _FaceProxy:
+    def __init__(self, bbox: np.ndarray, kps: np.ndarray | None) -> None:
+        self.bbox = bbox
+        self.kps = kps
+        self._attrs: dict[str, Any] = {}
+
+    def __setitem__(self, key: str, value: object) -> None:
+        self._attrs[key] = value
+
+    def __getitem__(self, key: str) -> object:
+        return self._attrs[key]
+
+    def get(self, key: str, default: object = None) -> object:
+        return self._attrs.get(key, default)

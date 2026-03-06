@@ -25,20 +25,25 @@ class FaceProvider(ABC):
     _loaded: bool = False
 
     @abstractmethod
-    def load_model(self) -> None:
-        """Load model weights. Called once at startup."""
+    def load_model(self) -> None: ...
 
     @abstractmethod
-    def detect(self, image_bytes: bytes) -> list[DetectedFace]:
-        """Return faces with bounding boxes and detection scores only."""
+    def detect(self, image_bytes: bytes) -> list[DetectedFace]: ...
 
     @abstractmethod
-    def embed(self, image_bytes: bytes) -> list[DetectedFace]:
-        """Return faces with bounding boxes + embedding vectors."""
+    def embed(self, image_bytes: bytes) -> list[DetectedFace]: ...
 
     @abstractmethod
-    def analyze(self, image_bytes: bytes) -> list[DetectedFace]:
-        """Return faces with bounding boxes + embeddings + demographics."""
+    def analyze(self, image_bytes: bytes) -> list[DetectedFace]: ...
+
+    def detect_batch(self, images: list[bytes]) -> list[list[DetectedFace]]:
+        return [self.detect(img) for img in images]
+
+    def embed_batch(self, images: list[bytes]) -> list[list[DetectedFace]]:
+        return [self.embed(img) for img in images]
+
+    def analyze_batch(self, images: list[bytes]) -> list[list[DetectedFace]]:
+        return [self.analyze(img) for img in images]
 
     @property
     @abstractmethod
