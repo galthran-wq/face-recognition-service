@@ -19,6 +19,8 @@ def create_provider(settings: Settings) -> FaceProvider:
             det_size=settings.face_det_size,
             model_name=settings.face_model_name,
             model_dir=settings.face_model_dir,
+            use_tensorrt=settings.face_use_tensorrt,
+            trt_cache_path=settings.face_trt_cache_path,
         )
 
     msg = f"Unknown face provider: {name!r}"
