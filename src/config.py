@@ -20,7 +20,9 @@ class Settings(BaseSettings):
     face_det_size: tuple[int, int] = (640, 640)
     face_model_name: str = "buffalo_l"
     face_model_dir: str = "~/.insightface"
-    face_max_batch_size: int = 20
+    face_max_batch_size: int = 64
+    face_use_tensorrt: bool = False
+    face_trt_cache_path: str = "/models/trt_cache"
 
     @field_validator("face_det_size", mode="before")
     @classmethod

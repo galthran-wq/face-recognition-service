@@ -152,23 +152,44 @@ Embeddings from the optimized pipeline are identical to the original `app.get()`
 - Max absolute difference: 0.00008 (float32 precision noise)
 - Embeddings are L2-normalized to unit vectors
 
+## Round 3: TensorRT EP with FP16 (implemented)
+
+Enabled TensorRT Execution Provider with FP16 via `FACE_USE_TENSORRT=true`. ORT automatically
+builds optimized TRT engines on first run (cached for subsequent starts). Also increased
+batch limit from 20 to 64.
+
+### TensorRT FP16 vs CUDA EP baseline (RTX 4090, 50 iter, 10 warmup, t1.jpg 6 faces)
+
+| Metric | CUDA EP | TensorRT FP16 | Speedup |
+|--------|---------|---------------|---------|
+| Detection p50 | 8.4ms | **5.8ms** | **1.45x** |
+| Recognition (1 face) p50 | 2.5ms | **1.7ms** | **1.47x** |
+| Full pipeline p50 | 80.0ms | **41.7ms** | **1.9x** |
+
+### Recognition batch throughput
+
+| Batch | CUDA EP | TensorRT FP16 | Speedup |
+|-------|---------|---------------|---------|
+| 1 | 340 faces/sec | **1,130 faces/sec** | **3.3x** |
+| 4 | 1,264 faces/sec | **3,275 faces/sec** | **2.6x** |
+| 8 | 2,089 faces/sec | **3,602 faces/sec** | **1.7x** |
+| 16 | 2,543 faces/sec | **5,371 faces/sec** | **2.1x** |
+| 32 | 2,574 faces/sec | **5,880 faces/sec** | **2.3x** |
+
+### Setup
+
+- Requires `FACE_USE_TENSORRT=true` env var
+- TRT engine cache path: `FACE_TRT_CACHE_PATH` (default: `/models/trt_cache`)
+- First startup builds TRT engines (~30-60s total), subsequent starts load from cache
+- Dockerfile.gpu includes `tensorrt-cu12-libs==10.7.0` for CUDA 12.x compatibility
+- Falls back to CUDA EP automatically for any unsupported ops
+
 ## Remaining optimization opportunities
 
 ### Medium effort
 
-1. **TensorRT conversion.** Expected 2-3x speedup for each model, particularly detection.
-   Would bring `detect()` to ~5-7ms and `embed()` to ~8-10ms per image.
-
-2. **FP16 inference.** Enable via ONNX Runtime session options. Expected 1.2-1.5x speedup
-   with negligible accuracy loss.
-
-3. **Increase batch API limit.** Current limit is 20 images. With batched inference,
-   higher limits are practical without proportional latency increase.
-
-### Larger optimizations
-
-4. **Concurrent detection + recognition.** Detection for image N+1 can overlap with
+1. **Concurrent detection + recognition.** Detection for image N+1 can overlap with
    recognition for image N using CUDA streams. Would reduce batch latency by ~30%.
 
-5. **Detection model with dynamic batch.** Replace SCRFD with a detection model that supports
-   batch>1 input. This would unlock true batch-level parallelism for the detection stage.
+2. **INT8 quantization.** Expected 2-4x over FP32 but requires calibration dataset
+   and accuracy validation. Diminishing returns given TRT FP16 already provides major gains.

@@ -1,10 +1,51 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
+import cv2
 import numpy as np
 
 from src.services.face_provider.base import BoundingBox, DetectedFace, FaceProvider
+
+_BATCH_THREAD_WORKERS = 4
+
+# ArcFace reference landmarks for 112x112 alignment
+_ARCFACE_DST = np.array(
+    [[38.2946, 51.6963], [73.5318, 51.5014], [56.0252, 71.7366], [41.5493, 92.3655], [70.7299, 92.2041]],
+    dtype=np.float32,
+)
+
+
+def _estimate_norm(lmk: np.ndarray, image_size: int = 112) -> np.ndarray:
+    """Estimate similarity transform matrix from 5 landmarks.
+
+    Pure numpy replacement for skimage.transform.SimilarityTransform.estimate().
+    Uses np.linalg.lstsq which releases the GIL, making this thread-safe.
+    """
+    ratio = float(image_size) / 112.0
+    dst = _ARCFACE_DST * ratio
+
+    # Solve for similarity transform: x' = a*x - b*y + tx, y' = b*x + a*y + ty
+    n = lmk.shape[0]
+    coeff = np.zeros((n * 2, 4), dtype=np.float64)
+    target = np.zeros(n * 2, dtype=np.float64)
+    for i in range(n):
+        coeff[2 * i] = [lmk[i, 0], -lmk[i, 1], 1, 0]
+        coeff[2 * i + 1] = [lmk[i, 1], lmk[i, 0], 0, 1]
+        target[2 * i] = dst[i, 0]
+        target[2 * i + 1] = dst[i, 1]
+
+    params, _, _, _ = np.linalg.lstsq(coeff, target, rcond=None)
+    a, b_val, tx, ty = params
+    mat = np.array([[a, -b_val, tx], [b_val, a, ty]], dtype=np.float64)
+    return mat
+
+
+def _norm_crop(img: np.ndarray, landmark: np.ndarray, image_size: int = 112) -> np.ndarray:
+    """Align and crop face using similarity transform. GIL-free alternative to insightface norm_crop."""
+    mat = _estimate_norm(landmark, image_size)
+    return cv2.warpAffine(img, mat, (image_size, image_size), borderValue=0.0)
 
 
 def _to_float(v: Any) -> float | None:
@@ -23,23 +64,80 @@ class InsightFaceProvider(FaceProvider):
         det_size: tuple[int, int] = (640, 640),
         model_name: str = "buffalo_l",
         model_dir: str = "~/.insightface",
+        use_tensorrt: bool = False,
+        trt_cache_path: str = "/models/trt_cache",
     ) -> None:
         self._use_gpu = use_gpu
         self._ctx_id = ctx_id
         self._det_size = det_size
         self._model_name = model_name
         self._model_dir = model_dir
+        self._use_tensorrt = use_tensorrt
+        self._trt_cache_path = trt_cache_path
         self._app: Any = None
 
     def load_model(self) -> None:
+        import onnxruntime as ort  # type: ignore[import-untyped]
+        import structlog
         from insightface.app import FaceAnalysis  # type: ignore[import-untyped]
+        from insightface.model_zoo.model_zoo import PickableInferenceSession  # type: ignore[import-untyped]
 
-        providers: list[str] = (
-            ["CUDAExecutionProvider", "CPUExecutionProvider"] if self._use_gpu else ["CPUExecutionProvider"]
-        )
-        self._app = FaceAnalysis(name=self._model_name, root=self._model_dir, providers=providers)
+        log = structlog.get_logger()
+
+        # Monkey-patch to inject SessionOptions into all insightface ORT sessions.
+        # FaceAnalysis only forwards `providers` and `provider_options` to sessions,
+        # not `sess_options` (model_zoo.py:94-96). This patch fills the gap.
+        _original_init = PickableInferenceSession.__init__
+
+        def _patched_init(self_sess: PickableInferenceSession, model_path: str, **kwargs: Any) -> None:
+            if "sess_options" not in kwargs:
+                so = ort.SessionOptions()
+                so.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+                so.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
+                so.enable_mem_pattern = True
+                so.enable_mem_reuse = True
+                kwargs["sess_options"] = so
+            _original_init(self_sess, model_path, **kwargs)
+
+        PickableInferenceSession.__init__ = _patched_init
+
+        cuda_ep_opts: dict[str, str] = {
+            "device_id": str(self._ctx_id),
+            "arena_extend_strategy": "kSameAsRequested",
+            "cudnn_conv_algo_search": "EXHAUSTIVE",
+            "do_copy_in_default_stream": "1",
+            "cudnn_conv_use_max_workspace": "1",
+        }
+
+        if self._use_gpu and self._use_tensorrt:
+            import os
+
+            os.makedirs(self._trt_cache_path, exist_ok=True)
+            trt_ep_opts: dict[str, str] = {
+                "device_id": str(self._ctx_id),
+                "trt_fp16_enable": "True",
+                "trt_engine_cache_enable": "True",
+                "trt_engine_cache_path": self._trt_cache_path,
+                "trt_max_workspace_size": str(2 * 1024**3),
+            }
+            providers = ["TensorrtExecutionProvider", "CUDAExecutionProvider", "CPUExecutionProvider"]
+            provider_options: list[dict[str, str]] = [trt_ep_opts, cuda_ep_opts, {}]
+            log.info("tensorrt_enabled", trt_options=trt_ep_opts, cache_path=self._trt_cache_path)
+        elif self._use_gpu:
+            providers = ["CUDAExecutionProvider", "CPUExecutionProvider"]
+            provider_options = [cuda_ep_opts, {}]
+        else:
+            providers = ["CPUExecutionProvider"]
+            provider_options = [{}]
+
+        fa_kwargs: dict[str, Any] = {"providers": providers, "provider_options": provider_options}
+
+        self._app = FaceAnalysis(name=self._model_name, root=self._model_dir, **fa_kwargs)
         self._app.prepare(ctx_id=self._ctx_id, det_size=self._det_size)
         self._loaded = True
+
+        # Restore original init to avoid side effects on other code
+        PickableInferenceSession.__init__ = _original_init
 
     def _decode_image(self, image_bytes: bytes) -> np.ndarray | None:
         import cv2
@@ -57,12 +155,10 @@ class InsightFaceProvider(FaceProvider):
         return BoundingBox(x=x1, y=y1, width=max(0.0, x2 - x1), height=max(0.0, y2 - y1))
 
     def _align_and_embed(self, img: np.ndarray, kpss: np.ndarray) -> np.ndarray:
-        from insightface.utils import face_align  # type: ignore[import-untyped]
-
         rec_model = self._app.models["recognition"]
         crops = []
         for kps in kpss:
-            aimg = face_align.norm_crop(img, landmark=kps, image_size=rec_model.input_size[0])
+            aimg = _norm_crop(img, landmark=kps, image_size=rec_model.input_size[0])
             crops.append(aimg)
         embeddings: np.ndarray = rec_model.get_feat(crops)
         norms = np.linalg.norm(embeddings, axis=1, keepdims=True)
@@ -145,31 +241,37 @@ class InsightFaceProvider(FaceProvider):
         return results
 
     def embed_batch(self, images: list[bytes]) -> list[list[DetectedFace]]:
-        from insightface.utils import face_align
-
         rec_model = self._app.models["recognition"]
+        image_size = rec_model.input_size[0]
 
+        # Stage 1: Decode images in parallel (cv2.imdecode releases the GIL)
+        with ThreadPoolExecutor(max_workers=_BATCH_THREAD_WORKERS) as pool:
+            decoded = list(pool.map(self._decode_image, images))
+
+        # Stage 2: Detect faces (GPU, must be sequential)
         per_image: list[tuple[np.ndarray, np.ndarray | None, np.ndarray | None]] = []
-        all_crops: list[np.ndarray] = []
-        crop_counts: list[int] = []
-
-        for image_bytes in images:
-            img = self._decode_image(image_bytes)
+        for img in decoded:
             if img is None:
                 per_image.append((np.zeros((0, 5)), None, None))
+            else:
+                bboxes, kpss = self._detect_faces(img)
+                per_image.append((bboxes, kpss, img))
+
+        # Stage 3: Align face crops in parallel (_norm_crop releases the GIL)
+        all_crops: list[np.ndarray] = []
+        crop_counts: list[int] = []
+        align_tasks: list[tuple[np.ndarray, np.ndarray]] = []
+        for bboxes, kpss, img in per_image:
+            if bboxes.shape[0] == 0 or kpss is None or img is None:
                 crop_counts.append(0)
                 continue
-
-            bboxes, kpss = self._detect_faces(img)
-            per_image.append((bboxes, kpss, img))
-            if bboxes.shape[0] == 0 or kpss is None:
-                crop_counts.append(0)
-                continue
-
             for kps in kpss:
-                aimg = face_align.norm_crop(img, landmark=kps, image_size=rec_model.input_size[0])
-                all_crops.append(aimg)
+                align_tasks.append((img, kps))
             crop_counts.append(bboxes.shape[0])
+
+        if align_tasks:
+            with ThreadPoolExecutor(max_workers=_BATCH_THREAD_WORKERS) as pool:
+                all_crops = list(pool.map(lambda t: _norm_crop(t[0], t[1], image_size), align_tasks))
 
         if all_crops:
             all_embeddings: np.ndarray = rec_model.get_feat(all_crops)
@@ -198,32 +300,38 @@ class InsightFaceProvider(FaceProvider):
         return results
 
     def analyze_batch(self, images: list[bytes]) -> list[list[DetectedFace]]:
-        from insightface.utils import face_align
-
         rec_model = self._app.models["recognition"]
         ga_model = self._app.models.get("genderage")
+        image_size = rec_model.input_size[0]
 
+        # Stage 1: Decode images in parallel (cv2.imdecode releases the GIL)
+        with ThreadPoolExecutor(max_workers=_BATCH_THREAD_WORKERS) as pool:
+            decoded = list(pool.map(self._decode_image, images))
+
+        # Stage 2: Detect faces (GPU, must be sequential)
         per_image: list[tuple[np.ndarray, np.ndarray | None, np.ndarray | None]] = []
-        all_crops: list[np.ndarray] = []
-        crop_counts: list[int] = []
-
-        for image_bytes in images:
-            img = self._decode_image(image_bytes)
+        for img in decoded:
             if img is None:
                 per_image.append((np.zeros((0, 5)), None, None))
+            else:
+                bboxes, kpss = self._detect_faces(img)
+                per_image.append((bboxes, kpss, img))
+
+        # Stage 3: Align face crops in parallel (_norm_crop releases the GIL)
+        all_crops: list[np.ndarray] = []
+        crop_counts: list[int] = []
+        align_tasks: list[tuple[np.ndarray, np.ndarray]] = []
+        for bboxes, kpss, img in per_image:
+            if bboxes.shape[0] == 0 or kpss is None or img is None:
                 crop_counts.append(0)
                 continue
-
-            bboxes, kpss = self._detect_faces(img)
-            per_image.append((bboxes, kpss, img))
-            if bboxes.shape[0] == 0 or kpss is None:
-                crop_counts.append(0)
-                continue
-
             for kps in kpss:
-                aimg = face_align.norm_crop(img, landmark=kps, image_size=rec_model.input_size[0])
-                all_crops.append(aimg)
+                align_tasks.append((img, kps))
             crop_counts.append(bboxes.shape[0])
+
+        if align_tasks:
+            with ThreadPoolExecutor(max_workers=_BATCH_THREAD_WORKERS) as pool:
+                all_crops = list(pool.map(lambda t: _norm_crop(t[0], t[1], image_size), align_tasks))
 
         if all_crops:
             all_embeddings: np.ndarray = rec_model.get_feat(all_crops)
