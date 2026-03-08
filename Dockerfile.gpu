@@ -36,9 +36,16 @@ ARG ONNXRT_VERSION=1.24.1
 RUN uv pip uninstall --python .venv/bin/python onnxruntime \
     && uv pip install --python .venv/bin/python onnxruntime-gpu==${ONNXRT_VERSION}
 
+# Install TensorRT runtime for TensorRT EP (optional, enabled via FACE_USE_TENSORRT=true).
+# Pin to TRT 10.7 which is built for CUDA 12.x (compatible with driver 550+).
+# The apt repo only has TRT for CUDA 13.1 which requires a newer driver.
+RUN uv pip install --python .venv/bin/python \
+    tensorrt-cu12-libs==10.7.0 tensorrt-cu12-bindings==10.7.0
+
 COPY src/ src/
 
 ENV PATH="/app/.venv/bin:$PATH"
+ENV LD_LIBRARY_PATH="/app/.venv/lib/python3.12/site-packages/tensorrt_libs:${LD_LIBRARY_PATH}"
 ENV FACE_MODEL_DIR=/models
 
 EXPOSE 8000

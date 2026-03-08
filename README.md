@@ -81,7 +81,55 @@ Set via environment variables or `.env` file (see `.env.example`):
 | `FACE_MODEL_NAME` | `buffalo_l` | InsightFace model pack |
 | `FACE_MODEL_DIR` | `~/.insightface` | Directory for downloaded model files |
 | `FACE_DET_SIZE` | `640,640` | Detection input resolution |
-| `FACE_MAX_BATCH_SIZE` | `20` | Max images per batch request |
+| `FACE_MAX_BATCH_SIZE` | `64` | Max images per batch request |
+| `FACE_USE_TENSORRT` | `false` | Enable TensorRT EP with FP16 (GPU only) |
+| `FACE_TRT_CACHE_PATH` | `/models/trt_cache` | TRT engine cache directory |
+
+## GPU Performance
+
+The default InsightFace pipeline (`app.get()`) runs all 5 models (detection, recognition, 2 landmark models, genderage) per face sequentially, regardless of what the endpoint actually needs. On an RTX 4090, a single image takes ~78ms through this pipeline no matter which endpoint you call.
+
+Three optimizations reduce this to **5.8-22ms** depending on the endpoint:
+
+1. **Selective model execution.** Each endpoint runs only the models it needs. `detect` runs SCRFD only (skips recognition, landmarks, genderage). `embed` runs detection + recognition (skips landmarks, genderage). This alone gives a **3.6-5.4x** speedup per request.
+
+2. **Batched recognition.** Instead of embedding faces one-by-one, all face crops (within and across images) go through the recognition model in a single batched call. The recognition model scales near-linearly up to batch=32 on RTX 4090.
+
+3. **TensorRT FP16 inference.** Enabling TensorRT Execution Provider with FP16 precision gives another **1.5-2.3x** on top. Embedding quality is unaffected (cosine similarity 0.9998+ vs FP32).
+
+We also tested batched detection (running SCRFD on multiple images at once), but it provided no benefit on GPU — SCRFD is already efficient at ~6ms per image.
+
+### Benchmarks (RTX 4090, buffalo_l, 640x640 detection)
+
+Per-image latency (p50, lower is better):
+
+| Endpoint | Original | Optimized (CUDA EP) | + TensorRT FP16 |
+|----------|----------|---------------------|-----------------|
+| `detect` | 78ms | 8.5ms | **5.8ms** |
+| `embed` | 78ms | 21.5ms | **~14ms** |
+| `analyze` | 78ms | 32.2ms | **~22ms** |
+
+Recognition model throughput (isolated, not end-to-end):
+
+| Batch size | CUDA EP (FP32) | TensorRT FP16 |
+|-----------|----------------|---------------|
+| 1 | 323 faces/sec | 1,130 faces/sec |
+| 8 | 2,089 faces/sec | 3,602 faces/sec |
+| 32 | 2,574 faces/sec | 5,880 faces/sec |
+
+Latency numbers are per image regardless of face count — detection cost is fixed, recognition cost scales with the number of detected faces. Benchmarked on a 1280x886 image with 6 faces (InsightFace bundled t1.jpg). See [`benchmarks/analysis.md`](benchmarks/analysis.md) for full methodology and breakdown.
+
+### Recommended GPU configuration
+
+```bash
+docker run --gpus all -p 8000:8000 \
+  -v ~/.insightface:/models \
+  -e FACE_USE_TENSORRT=true \
+  -e FACE_TRT_CACHE_PATH=/models/trt_cache \
+  face-recognition-service:gpu
+```
+
+First startup builds TensorRT engines (~30-60s), cached for subsequent runs. Requires NVIDIA driver 550+ with CUDA 12.x.
 
 ## Model Caching
 

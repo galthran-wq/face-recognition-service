@@ -140,6 +140,6 @@ async def test_batch_with_invalid_image(client: AsyncClient) -> None:
 
 
 async def test_batch_exceeds_max_size(client: AsyncClient) -> None:
-    images = [{"image_b64": _TINY_PNG}] * 21  # default max is 20
+    images = [{"image_b64": _TINY_PNG}] * 65  # default max is 64
     resp = await client.post("/faces/detect/batch", json={"images": images})
     assert resp.status_code == 400

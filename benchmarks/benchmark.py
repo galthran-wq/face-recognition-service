@@ -126,13 +126,60 @@ def compute_latency(timings_s: list[float]) -> LatencyStats:
 # ---------------------------------------------------------------------------
 
 
-def load_model(use_gpu: bool, model_name: str, det_size: tuple[int, int], model_dir: str):
+def load_model(
+    use_gpu: bool,
+    model_name: str,
+    det_size: tuple[int, int],
+    model_dir: str,
+    use_tensorrt: bool = False,
+    trt_cache_path: str = "/tmp/trt_cache",
+):
     """Load InsightFace FaceAnalysis model and return the app instance."""
+    import onnxruntime as ort  # type: ignore[import-untyped]
     from insightface.app import FaceAnalysis  # type: ignore[import-untyped]
+    from insightface.model_zoo.model_zoo import PickableInferenceSession  # type: ignore[import-untyped]
 
-    providers = ["CUDAExecutionProvider", "CPUExecutionProvider"] if use_gpu else ["CPUExecutionProvider"]
-    app = FaceAnalysis(name=model_name, root=model_dir, providers=providers)
+    # Inject SessionOptions into all insightface ORT sessions
+    _original_init = PickableInferenceSession.__init__
+
+    def _patched_init(self_sess, model_path, **kwargs):
+        if "sess_options" not in kwargs:
+            so = ort.SessionOptions()
+            so.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+            so.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
+            so.enable_mem_pattern = True
+            so.enable_mem_reuse = True
+            kwargs["sess_options"] = so
+        _original_init(self_sess, model_path, **kwargs)
+
+    PickableInferenceSession.__init__ = _patched_init
+
+    fa_kwargs: dict = {}
+    if use_gpu and use_tensorrt:
+        os.makedirs(trt_cache_path, exist_ok=True)
+        fa_kwargs["providers"] = ["TensorrtExecutionProvider", "CUDAExecutionProvider", "CPUExecutionProvider"]
+        fa_kwargs["provider_options"] = [
+            {
+                "device_id": "0",
+                "trt_fp16_enable": "True",
+                "trt_engine_cache_enable": "True",
+                "trt_engine_cache_path": trt_cache_path,
+                "trt_max_workspace_size": str(2 * 1024**3),
+            },
+            {"device_id": "0"},
+            {},
+        ]
+        print(f"  TensorRT enabled (FP16, cache: {trt_cache_path})")
+    elif use_gpu:
+        fa_kwargs["providers"] = ["CUDAExecutionProvider", "CPUExecutionProvider"]
+        fa_kwargs["provider_options"] = [{"device_id": "0"}, {}]
+    else:
+        fa_kwargs["providers"] = ["CPUExecutionProvider"]
+
+    app = FaceAnalysis(name=model_name, root=model_dir, **fa_kwargs)
     app.prepare(ctx_id=0 if use_gpu else -1, det_size=det_size)
+
+    PickableInferenceSession.__init__ = _original_init
     return app
 
 
@@ -385,6 +432,8 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument("--output-dir", type=str, default="benchmarks/results", help="Directory for JSON output")
     p.add_argument("--no-save", action="store_true", help="Skip saving JSON results")
+    p.add_argument("--tensorrt", action="store_true", help="Enable TensorRT EP with FP16")
+    p.add_argument("--trt-cache", type=str, default="/tmp/trt_cache", help="TensorRT engine cache directory")
     p.add_argument("--skip-single", action="store_true", help="Skip single-image benchmarks")
     p.add_argument("--skip-e2e", action="store_true", help="Skip end-to-end batch benchmarks (slow)")
     return p.parse_args()
@@ -420,7 +469,10 @@ def main() -> None:
     # Load model
     print("\nLoading model...")
     t0 = time.perf_counter()
-    app = load_model(use_gpu, args.model_name, det_size, args.model_dir)
+    app = load_model(
+        use_gpu, args.model_name, det_size, args.model_dir,
+        use_tensorrt=args.tensorrt, trt_cache_path=args.trt_cache,
+    )
     load_time = time.perf_counter() - t0
     print(f"  Model loaded in {load_time:.1f}s")
 
