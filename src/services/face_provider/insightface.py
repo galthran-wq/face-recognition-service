@@ -166,17 +166,27 @@ class InsightFaceProvider(FaceProvider):
         normalized: np.ndarray = embeddings / norms
         return normalized
 
+    @staticmethod
+    def _kps_to_landmarks(kps: np.ndarray | None) -> list[tuple[float, float]] | None:
+        if kps is None:
+            return None
+        return [(float(p[0]), float(p[1])) for p in kps]
+
     def detect(self, image_bytes: bytes) -> list[DetectedFace]:
         img = self._decode_image(image_bytes)
         if img is None:
             return []
 
-        bboxes, _kpss = self._detect_faces(img)
+        bboxes, kpss = self._detect_faces(img)
         if bboxes.shape[0] == 0:
             return []
 
         return [
-            DetectedFace(bbox=self._make_bbox(bboxes[i, :4]), det_score=float(bboxes[i, 4]))
+            DetectedFace(
+                bbox=self._make_bbox(bboxes[i, :4]),
+                det_score=float(bboxes[i, 4]),
+                landmarks=self._kps_to_landmarks(kpss[i] if kpss is not None else None),
+            )
             for i in range(bboxes.shape[0])
         ]
 
@@ -196,6 +206,7 @@ class InsightFaceProvider(FaceProvider):
                 bbox=self._make_bbox(bboxes[i, :4]),
                 det_score=float(bboxes[i, 4]),
                 embedding=embeddings[i].astype(np.float32).tolist(),
+                landmarks=self._kps_to_landmarks(kpss[i]),
             )
             for i in range(bboxes.shape[0])
         ]
@@ -235,6 +246,7 @@ class InsightFaceProvider(FaceProvider):
                     embedding=embeddings[i].astype(np.float32).tolist(),
                     age=age,
                     gender=gender,
+                    landmarks=self._kps_to_landmarks(kpss[i]),
                 )
             )
 
@@ -283,7 +295,7 @@ class InsightFaceProvider(FaceProvider):
 
         results: list[list[DetectedFace]] = []
         emb_offset = 0
-        for idx, (bboxes, _kpss, _img) in enumerate(per_image):
+        for idx, (bboxes, kpss, _img) in enumerate(per_image):
             n = crop_counts[idx]
             faces: list[DetectedFace] = []
             for i in range(n):
@@ -292,6 +304,7 @@ class InsightFaceProvider(FaceProvider):
                         bbox=self._make_bbox(bboxes[i, :4]),
                         det_score=float(bboxes[i, 4]),
                         embedding=all_embeddings[emb_offset + i].astype(np.float32).tolist(),
+                        landmarks=self._kps_to_landmarks(kpss[i] if kpss is not None else None),
                     )
                 )
             emb_offset += n
@@ -368,6 +381,7 @@ class InsightFaceProvider(FaceProvider):
                         embedding=all_embeddings[emb_offset + i].astype(np.float32).tolist(),
                         age=age,
                         gender=gender,
+                        landmarks=self._kps_to_landmarks(kpss[i] if kpss is not None else None),
                     )
                 )
             emb_offset += n

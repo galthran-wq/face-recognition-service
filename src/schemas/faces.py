@@ -21,12 +21,18 @@ class BoundingBoxSchema(BaseModel):
     height: float
 
 
+class LandmarkPoint(BaseModel):
+    x: float
+    y: float
+
+
 # --- Per-endpoint face schemas ---
 
 
 class DetectFaceSchema(BaseModel):
     bbox: BoundingBoxSchema
     det_score: float
+    landmarks: list[LandmarkPoint] | None = None
 
 
 class EmbedFaceSchema(DetectFaceSchema):
