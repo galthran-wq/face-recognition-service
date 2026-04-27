@@ -10,6 +10,14 @@ from src.services.face_provider.base import BoundingBox, DetectedFace, FaceProvi
 
 _BATCH_THREAD_WORKERS = 4
 
+# Pad-to-square fallback: RetinaFace anchors miss faces that fill most of the
+# frame. Padding to a square with a gray border restores typical face-to-frame
+# ratio so anchors can match again. Applied transparently when the first
+# detection pass returns zero faces; output coordinates are translated back to
+# the original image space.
+_PAD_FALLBACK_BORDER_PX = 100
+_PAD_FALLBACK_FILL = 128
+
 # ArcFace reference landmarks for 112x112 alignment
 _ARCFACE_DST = np.array(
     [[38.2946, 51.6963], [73.5318, 51.5014], [56.0252, 71.7366], [41.5493, 92.3655], [70.7299, 92.2041]],
@@ -150,8 +158,47 @@ class InsightFaceProvider(FaceProvider):
         return bboxes, kpss
 
     @staticmethod
-    def _make_bbox(raw_bbox: np.ndarray) -> BoundingBox:
+    def _pad_to_square(img: np.ndarray) -> tuple[np.ndarray, int, int]:
+        h, w = img.shape[:2]
+        side = max(h, w) + 2 * _PAD_FALLBACK_BORDER_PX
+        canvas = np.full((side, side, 3), _PAD_FALLBACK_FILL, dtype=img.dtype)
+        dy = (side - h) // 2
+        dx = (side - w) // 2
+        canvas[dy : dy + h, dx : dx + w] = img
+        return canvas, dx, dy
+
+    def _detect_with_pad_fallback(self, img: np.ndarray) -> tuple[np.ndarray, np.ndarray | None, np.ndarray, int, int]:
+        """Detect faces; on miss, pad to square and retry once.
+
+        Returns (bboxes, kpss, working_img, dx, dy). Coordinates in bboxes/kpss
+        are in working_img space — alignment must use working_img, but bboxes
+        and landmarks emitted to clients must be translated back via
+        _translate_bbox / _translate_landmarks using (dx, dy) and the original
+        frame dimensions.
+        """
+        bboxes, kpss = self._detect_faces(img)
+        if bboxes.shape[0] > 0:
+            return bboxes, kpss, img, 0, 0
+        padded, dx, dy = self._pad_to_square(img)
+        bboxes, kpss = self._detect_faces(padded)
+        return bboxes, kpss, padded, dx, dy
+
+    @staticmethod
+    def _make_bbox(raw_bbox: np.ndarray, dx: int = 0, dy: int = 0, orig_w: int = 0, orig_h: int = 0) -> BoundingBox:
         x1, y1, x2, y2 = (float(v) for v in raw_bbox[:4])
+        if dx or dy:
+            x1 -= dx
+            y1 -= dy
+            x2 -= dx
+            y2 -= dy
+            # Clip to original frame; faces touching the edge can have bbox
+            # extend slightly outside after translation.
+            max_w = float(orig_w)
+            max_h = float(orig_h)
+            x1 = max(0.0, min(x1, max_w))
+            y1 = max(0.0, min(y1, max_h))
+            x2 = max(0.0, min(x2, max_w))
+            y2 = max(0.0, min(y2, max_h))
         return BoundingBox(x=x1, y=y1, width=max(0.0, x2 - x1), height=max(0.0, y2 - y1))
 
     def _align_and_embed(self, img: np.ndarray, kpss: np.ndarray) -> np.ndarray:
@@ -167,9 +214,11 @@ class InsightFaceProvider(FaceProvider):
         return normalized
 
     @staticmethod
-    def _kps_to_landmarks(kps: np.ndarray | None) -> list[tuple[float, float]] | None:
+    def _kps_to_landmarks(kps: np.ndarray | None, dx: int = 0, dy: int = 0) -> list[tuple[float, float]] | None:
         if kps is None:
             return None
+        if dx or dy:
+            return [(float(p[0]) - dx, float(p[1]) - dy) for p in kps]
         return [(float(p[0]), float(p[1])) for p in kps]
 
     def detect(self, image_bytes: bytes) -> list[DetectedFace]:
@@ -177,15 +226,16 @@ class InsightFaceProvider(FaceProvider):
         if img is None:
             return []
 
-        bboxes, kpss = self._detect_faces(img)
+        bboxes, kpss, _working, dx, dy = self._detect_with_pad_fallback(img)
         if bboxes.shape[0] == 0:
             return []
 
+        orig_h, orig_w = img.shape[:2]
         return [
             DetectedFace(
-                bbox=self._make_bbox(bboxes[i, :4]),
+                bbox=self._make_bbox(bboxes[i, :4], dx, dy, orig_w, orig_h),
                 det_score=float(bboxes[i, 4]),
-                landmarks=self._kps_to_landmarks(kpss[i] if kpss is not None else None),
+                landmarks=self._kps_to_landmarks(kpss[i] if kpss is not None else None, dx, dy),
             )
             for i in range(bboxes.shape[0])
         ]
@@ -195,18 +245,21 @@ class InsightFaceProvider(FaceProvider):
         if img is None:
             return []
 
-        bboxes, kpss = self._detect_faces(img)
+        bboxes, kpss, working, dx, dy = self._detect_with_pad_fallback(img)
         if bboxes.shape[0] == 0 or kpss is None:
             return []
 
-        embeddings = self._align_and_embed(img, kpss)
+        # Alignment uses padded coords + padded image so it can sample past the
+        # original edges without hitting black borders.
+        embeddings = self._align_and_embed(working, kpss)
 
+        orig_h, orig_w = img.shape[:2]
         return [
             DetectedFace(
-                bbox=self._make_bbox(bboxes[i, :4]),
+                bbox=self._make_bbox(bboxes[i, :4], dx, dy, orig_w, orig_h),
                 det_score=float(bboxes[i, 4]),
                 embedding=embeddings[i].astype(np.float32).tolist(),
-                landmarks=self._kps_to_landmarks(kpss[i]),
+                landmarks=self._kps_to_landmarks(kpss[i], dx, dy),
             )
             for i in range(bboxes.shape[0])
         ]
@@ -216,13 +269,14 @@ class InsightFaceProvider(FaceProvider):
         if img is None:
             return []
 
-        bboxes, kpss = self._detect_faces(img)
+        bboxes, kpss, working, dx, dy = self._detect_with_pad_fallback(img)
         if bboxes.shape[0] == 0 or kpss is None:
             return []
 
-        embeddings = self._align_and_embed(img, kpss)
+        embeddings = self._align_and_embed(working, kpss)
         ga_model = self._app.models.get("genderage")
 
+        orig_h, orig_w = img.shape[:2]
         results: list[DetectedFace] = []
         for i in range(bboxes.shape[0]):
             age: float | None = None
@@ -230,7 +284,7 @@ class InsightFaceProvider(FaceProvider):
 
             if ga_model is not None:
                 face_obj = _FaceProxy(bbox=bboxes[i, :4], kps=kpss[i] if kpss is not None else None)
-                ga_model.get(img, face_obj)
+                ga_model.get(working, face_obj)
                 age = _to_float(face_obj.get("age"))
                 gender_val = face_obj.get("gender")
                 if gender_val is not None:
@@ -241,12 +295,12 @@ class InsightFaceProvider(FaceProvider):
 
             results.append(
                 DetectedFace(
-                    bbox=self._make_bbox(bboxes[i, :4]),
+                    bbox=self._make_bbox(bboxes[i, :4], dx, dy, orig_w, orig_h),
                     det_score=float(bboxes[i, 4]),
                     embedding=embeddings[i].astype(np.float32).tolist(),
                     age=age,
                     gender=gender,
-                    landmarks=self._kps_to_landmarks(kpss[i]),
+                    landmarks=self._kps_to_landmarks(kpss[i], dx, dy),
                 )
             )
 
@@ -260,26 +314,28 @@ class InsightFaceProvider(FaceProvider):
         with ThreadPoolExecutor(max_workers=_BATCH_THREAD_WORKERS) as pool:
             decoded = list(pool.map(self._decode_image, images))
 
-        # Stage 2: Detect faces (GPU, must be sequential)
-        per_image: list[tuple[np.ndarray, np.ndarray | None, np.ndarray | None]] = []
+        # Stage 2: Detect faces (GPU, must be sequential). On miss, retry once
+        # on a padded copy — same fallback as the single-image path.
+        per_image: list[tuple[np.ndarray, np.ndarray | None, np.ndarray | None, int, int, int, int]] = []
         for img in decoded:
             if img is None:
-                per_image.append((np.zeros((0, 5)), None, None))
+                per_image.append((np.zeros((0, 5)), None, None, 0, 0, 0, 0))
             else:
-                bboxes, kpss = self._detect_faces(img)
-                per_image.append((bboxes, kpss, img))
+                bboxes, kpss, working, dx, dy = self._detect_with_pad_fallback(img)
+                per_image.append((bboxes, kpss, working, dx, dy, img.shape[0], img.shape[1]))
 
         # Stage 3: Align face crops in parallel (_norm_crop releases the GIL)
         all_crops: list[np.ndarray] = []
         crop_counts: list[int] = []
         align_tasks: list[tuple[np.ndarray, np.ndarray]] = []
-        for bboxes, kpss, img in per_image:
-            if bboxes.shape[0] == 0 or kpss is None or img is None:
+        for it in per_image:
+            it_bboxes, it_kpss, it_working = it[0], it[1], it[2]
+            if it_bboxes.shape[0] == 0 or it_kpss is None or it_working is None:
                 crop_counts.append(0)
                 continue
-            for kps in kpss:
-                align_tasks.append((img, kps))
-            crop_counts.append(bboxes.shape[0])
+            for kps in it_kpss:
+                align_tasks.append((it_working, kps))
+            crop_counts.append(it_bboxes.shape[0])
 
         if align_tasks:
             with ThreadPoolExecutor(max_workers=_BATCH_THREAD_WORKERS) as pool:
@@ -295,16 +351,17 @@ class InsightFaceProvider(FaceProvider):
 
         results: list[list[DetectedFace]] = []
         emb_offset = 0
-        for idx, (bboxes, kpss, _img) in enumerate(per_image):
+        for idx, it in enumerate(per_image):
+            it_bboxes, it_kpss, _, it_dx, it_dy, it_oh, it_ow = it
             n = crop_counts[idx]
             faces: list[DetectedFace] = []
             for i in range(n):
                 faces.append(
                     DetectedFace(
-                        bbox=self._make_bbox(bboxes[i, :4]),
-                        det_score=float(bboxes[i, 4]),
+                        bbox=self._make_bbox(it_bboxes[i, :4], it_dx, it_dy, it_ow, it_oh),
+                        det_score=float(it_bboxes[i, 4]),
                         embedding=all_embeddings[emb_offset + i].astype(np.float32).tolist(),
-                        landmarks=self._kps_to_landmarks(kpss[i] if kpss is not None else None),
+                        landmarks=self._kps_to_landmarks(it_kpss[i] if it_kpss is not None else None, it_dx, it_dy),
                     )
                 )
             emb_offset += n
@@ -321,26 +378,28 @@ class InsightFaceProvider(FaceProvider):
         with ThreadPoolExecutor(max_workers=_BATCH_THREAD_WORKERS) as pool:
             decoded = list(pool.map(self._decode_image, images))
 
-        # Stage 2: Detect faces (GPU, must be sequential)
-        per_image: list[tuple[np.ndarray, np.ndarray | None, np.ndarray | None]] = []
+        # Stage 2: Detect faces (GPU, must be sequential). On miss, retry once
+        # on a padded copy.
+        per_image: list[tuple[np.ndarray, np.ndarray | None, np.ndarray | None, int, int, int, int]] = []
         for img in decoded:
             if img is None:
-                per_image.append((np.zeros((0, 5)), None, None))
+                per_image.append((np.zeros((0, 5)), None, None, 0, 0, 0, 0))
             else:
-                bboxes, kpss = self._detect_faces(img)
-                per_image.append((bboxes, kpss, img))
+                bboxes, kpss, working, dx, dy = self._detect_with_pad_fallback(img)
+                per_image.append((bboxes, kpss, working, dx, dy, img.shape[0], img.shape[1]))
 
         # Stage 3: Align face crops in parallel (_norm_crop releases the GIL)
         all_crops: list[np.ndarray] = []
         crop_counts: list[int] = []
         align_tasks: list[tuple[np.ndarray, np.ndarray]] = []
-        for bboxes, kpss, img in per_image:
-            if bboxes.shape[0] == 0 or kpss is None or img is None:
+        for it in per_image:
+            it_bboxes, it_kpss, it_working = it[0], it[1], it[2]
+            if it_bboxes.shape[0] == 0 or it_kpss is None or it_working is None:
                 crop_counts.append(0)
                 continue
-            for kps in kpss:
-                align_tasks.append((img, kps))
-            crop_counts.append(bboxes.shape[0])
+            for kps in it_kpss:
+                align_tasks.append((it_working, kps))
+            crop_counts.append(it_bboxes.shape[0])
 
         if align_tasks:
             with ThreadPoolExecutor(max_workers=_BATCH_THREAD_WORKERS) as pool:
@@ -356,16 +415,17 @@ class InsightFaceProvider(FaceProvider):
 
         results: list[list[DetectedFace]] = []
         emb_offset = 0
-        for idx, (bboxes, kpss, img) in enumerate(per_image):
+        for idx, it in enumerate(per_image):
+            it_bboxes, it_kpss, it_working, it_dx, it_dy, it_oh, it_ow = it
             n = crop_counts[idx]
             faces: list[DetectedFace] = []
             for i in range(n):
                 age: float | None = None
                 gender: str | None = None
 
-                if ga_model is not None and img is not None and kpss is not None:
-                    face_obj = _FaceProxy(bbox=bboxes[i, :4], kps=kpss[i])
-                    ga_model.get(img, face_obj)
+                if ga_model is not None and it_working is not None and it_kpss is not None:
+                    face_obj = _FaceProxy(bbox=it_bboxes[i, :4], kps=it_kpss[i])
+                    ga_model.get(it_working, face_obj)
                     age = _to_float(face_obj.get("age"))
                     gender_val = face_obj.get("gender")
                     if gender_val is not None:
@@ -376,12 +436,12 @@ class InsightFaceProvider(FaceProvider):
 
                 faces.append(
                     DetectedFace(
-                        bbox=self._make_bbox(bboxes[i, :4]),
-                        det_score=float(bboxes[i, 4]),
+                        bbox=self._make_bbox(it_bboxes[i, :4], it_dx, it_dy, it_ow, it_oh),
+                        det_score=float(it_bboxes[i, 4]),
                         embedding=all_embeddings[emb_offset + i].astype(np.float32).tolist(),
                         age=age,
                         gender=gender,
-                        landmarks=self._kps_to_landmarks(kpss[i] if kpss is not None else None),
+                        landmarks=self._kps_to_landmarks(it_kpss[i] if it_kpss is not None else None, it_dx, it_dy),
                     )
                 )
             emb_offset += n

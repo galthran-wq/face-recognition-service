@@ -200,3 +200,156 @@ class TestInsightFaceProviderLoadModel:
     def test_is_loaded_default_false(self) -> None:
         provider = InsightFaceProvider()
         assert provider.is_loaded is False
+
+
+def _empty_det_output() -> tuple[np.ndarray, None]:
+    return np.zeros((0, 5), dtype=np.float32), None
+
+
+class TestPadSquareFallback:
+    """Pad-to-square fallback when the first detector pass returns zero faces.
+
+    _fake_image_bytes() returns a 100x100 image. _pad_to_square() adds a
+    100px gray border on every side, so the padded image is 300x300 with
+    offset (dx=100, dy=100). Coordinates returned by the detector on the
+    padded image are translated back to the original frame before being
+    handed to the client.
+    """
+
+    def test_no_fallback_when_first_pass_hits(self) -> None:
+        provider, mock_app = _create_provider_with_mock()
+        provider.detect(_fake_image_bytes())
+        assert mock_app.det_model.detect.call_count == 1
+
+    def test_fallback_runs_when_first_pass_empty(self) -> None:
+        provider, mock_app = _create_provider_with_mock()
+        retry_hit = _make_det_output([{"bbox": [110.0, 120.0, 180.0, 190.0], "det_score": 0.95}])
+        mock_app.det_model.detect.side_effect = [_empty_det_output(), retry_hit]
+
+        faces = provider.detect(_fake_image_bytes())
+        assert len(faces) == 1
+        assert mock_app.det_model.detect.call_count == 2
+
+    def test_both_passes_empty_returns_empty(self) -> None:
+        provider, mock_app = _create_provider_with_mock()
+        mock_app.det_model.detect.side_effect = [_empty_det_output(), _empty_det_output()]
+        faces = provider.detect(_fake_image_bytes())
+        assert faces == []
+        assert mock_app.det_model.detect.call_count == 2
+
+    def test_fallback_translates_bbox_to_original_coords(self) -> None:
+        provider, mock_app = _create_provider_with_mock()
+        # Padded bbox (110, 120, 180, 190) -> original (10, 20, 80, 90)
+        retry_hit = _make_det_output([{"bbox": [110.0, 120.0, 180.0, 190.0], "det_score": 0.95}])
+        mock_app.det_model.detect.side_effect = [_empty_det_output(), retry_hit]
+
+        faces = provider.detect(_fake_image_bytes())
+        assert len(faces) == 1
+        f = faces[0]
+        assert f.bbox.x == 10.0
+        assert f.bbox.y == 20.0
+        assert f.bbox.width == 70.0
+        assert f.bbox.height == 70.0
+
+    def test_fallback_clips_bbox_to_original_frame(self) -> None:
+        # Padded bbox (90, 90, 250, 250) -> translated (-10, -10, 150, 150)
+        # -> clipped to original 100x100 frame (0, 0, 100, 100).
+        provider, mock_app = _create_provider_with_mock()
+        retry_hit = _make_det_output([{"bbox": [90.0, 90.0, 250.0, 250.0], "det_score": 0.9}])
+        mock_app.det_model.detect.side_effect = [_empty_det_output(), retry_hit]
+
+        faces = provider.detect(_fake_image_bytes())
+        assert faces[0].bbox.x == 0.0
+        assert faces[0].bbox.y == 0.0
+        assert faces[0].bbox.width == 100.0
+        assert faces[0].bbox.height == 100.0
+
+    def test_fallback_translates_landmarks(self) -> None:
+        # _make_det_output places the third keypoint at the bbox center.
+        # Padded bbox center (145, 155) -> original (45, 55).
+        provider, mock_app = _create_provider_with_mock()
+        retry_hit = _make_det_output([{"bbox": [110.0, 120.0, 180.0, 190.0], "det_score": 0.95}])
+        mock_app.det_model.detect.side_effect = [_empty_det_output(), retry_hit]
+
+        faces = provider.detect(_fake_image_bytes())
+        landmarks = faces[0].landmarks
+        assert landmarks is not None
+        assert landmarks[2] == (45.0, 55.0)
+
+    def test_embed_fallback_returns_translated_bbox_with_embedding(self) -> None:
+        provider, mock_app = _create_provider_with_mock()
+        retry_hit = _make_det_output([{"bbox": [110.0, 120.0, 180.0, 190.0], "det_score": 0.95}])
+        mock_app.det_model.detect.side_effect = [_empty_det_output(), retry_hit]
+
+        faces = provider.embed(_fake_image_bytes())
+        assert len(faces) == 1
+        assert faces[0].embedding is not None
+        assert len(faces[0].embedding) == 512
+        assert faces[0].bbox.x == 10.0
+        assert faces[0].bbox.y == 20.0
+
+    def test_analyze_fallback_returns_translated_bbox_with_demographics(self) -> None:
+        provider, mock_app = _create_provider_with_mock()
+        mock_ga = MagicMock()
+
+        def fake_ga_get(img: object, face: object) -> tuple[int, int]:
+            face["gender"] = 1  # type: ignore[index]
+            face["age"] = 33  # type: ignore[index]
+            return 1, 33
+
+        mock_ga.get.side_effect = fake_ga_get
+        mock_app.models["genderage"] = mock_ga
+
+        retry_hit = _make_det_output([{"bbox": [110.0, 120.0, 180.0, 190.0], "det_score": 0.95}])
+        mock_app.det_model.detect.side_effect = [_empty_det_output(), retry_hit]
+
+        faces = provider.analyze(_fake_image_bytes())
+        assert faces[0].bbox.x == 10.0
+        assert faces[0].age == 33.0
+        assert faces[0].gender == "male"
+
+    def test_embed_batch_fallback_per_image(self) -> None:
+        # Two images: first hits on the first pass, second misses and hits on
+        # the padded retry. Verify each result lives in its own original frame.
+        provider, mock_app = _create_provider_with_mock()
+        first_hit = _make_det_output()  # bbox (10, 20, 110, 140) in original coords
+        retry_hit = _make_det_output([{"bbox": [110.0, 120.0, 180.0, 190.0], "det_score": 0.9}])
+        mock_app.det_model.detect.side_effect = [first_hit, _empty_det_output(), retry_hit]
+        mock_app.models["recognition"].get_feat.return_value = np.random.randn(2, 512).astype(np.float32)
+
+        results = provider.embed_batch([_fake_image_bytes(), _fake_image_bytes()])
+
+        assert len(results) == 2
+        assert len(results[0]) == 1
+        assert results[0][0].bbox.x == 10.0  # first image: untranslated
+        assert results[0][0].bbox.width == 100.0
+        assert len(results[1]) == 1
+        assert results[1][0].bbox.x == 10.0  # second image: translated from padded coords
+        assert results[1][0].bbox.y == 20.0
+        assert mock_app.det_model.detect.call_count == 3
+
+    def test_embed_batch_no_fallback_when_all_hit(self) -> None:
+        provider, mock_app = _create_provider_with_mock()
+        mock_app.models["recognition"].get_feat.return_value = np.random.randn(2, 512).astype(np.float32)
+
+        results = provider.embed_batch([_fake_image_bytes(), _fake_image_bytes()])
+        assert len(results) == 2
+        # No retries — one detect call per image.
+        assert mock_app.det_model.detect.call_count == 2
+
+    def test_pad_to_square_square_input(self) -> None:
+        img = np.full((100, 100, 3), 50, dtype=np.uint8)
+        padded, dx, dy = InsightFaceProvider._pad_to_square(img)
+        assert padded.shape == (300, 300, 3)
+        assert dx == 100
+        assert dy == 100
+        assert padded[0, 0].tolist() == [128, 128, 128]  # gray border
+        assert padded[150, 150].tolist() == [50, 50, 50]  # original preserved at center
+
+    def test_pad_to_square_non_square_input(self) -> None:
+        # h=80, w=120 -> side = max(80, 120) + 200 = 320
+        img = np.zeros((80, 120, 3), dtype=np.uint8)
+        padded, dx, dy = InsightFaceProvider._pad_to_square(img)
+        assert padded.shape == (320, 320, 3)
+        assert dx == (320 - 120) // 2  # 100
+        assert dy == (320 - 80) // 2  # 120
