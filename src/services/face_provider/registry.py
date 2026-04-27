@@ -21,6 +21,8 @@ def create_provider(settings: Settings) -> FaceProvider:
             model_dir=settings.face_model_dir,
             use_tensorrt=settings.face_use_tensorrt,
             trt_cache_path=settings.face_trt_cache_path,
+            pad_fallback_border_px=settings.face_pad_fallback_border_px,
+            pad_fallback_fill=settings.face_pad_fallback_fill,
         )
 
     msg = f"Unknown face provider: {name!r}"

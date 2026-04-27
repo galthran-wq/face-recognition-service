@@ -23,6 +23,9 @@ class Settings(BaseSettings):
     face_max_batch_size: int = 64
     face_use_tensorrt: bool = False
     face_trt_cache_path: str = "/models/trt_cache"
+    # Pad-to-square fallback for frame-filling faces missed by RetinaFace anchors.
+    face_pad_fallback_border_px: int = 100
+    face_pad_fallback_fill: int = 128
 
     @field_validator("face_det_size", mode="before")
     @classmethod

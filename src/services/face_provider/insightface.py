@@ -14,9 +14,8 @@ _BATCH_THREAD_WORKERS = 4
 # frame. Padding to a square with a gray border restores typical face-to-frame
 # ratio so anchors can match again. Applied transparently when the first
 # detection pass returns zero faces; output coordinates are translated back to
-# the original image space.
-_PAD_FALLBACK_BORDER_PX = 100
-_PAD_FALLBACK_FILL = 128
+# the original image space. Border/fill values are configurable per provider
+# instance via `pad_fallback_border_px` / `pad_fallback_fill`.
 
 # ArcFace reference landmarks for 112x112 alignment
 _ARCFACE_DST = np.array(
@@ -74,6 +73,8 @@ class InsightFaceProvider(FaceProvider):
         model_dir: str = "~/.insightface",
         use_tensorrt: bool = False,
         trt_cache_path: str = "/models/trt_cache",
+        pad_fallback_border_px: int = 100,
+        pad_fallback_fill: int = 128,
     ) -> None:
         self._use_gpu = use_gpu
         self._ctx_id = ctx_id
@@ -82,6 +83,8 @@ class InsightFaceProvider(FaceProvider):
         self._model_dir = model_dir
         self._use_tensorrt = use_tensorrt
         self._trt_cache_path = trt_cache_path
+        self._pad_border_px = pad_fallback_border_px
+        self._pad_fill = pad_fallback_fill
         self._app: Any = None
 
     def load_model(self) -> None:
@@ -157,11 +160,10 @@ class InsightFaceProvider(FaceProvider):
         bboxes, kpss = self._app.det_model.detect(img, max_num=0, metric="default")
         return bboxes, kpss
 
-    @staticmethod
-    def _pad_to_square(img: np.ndarray) -> tuple[np.ndarray, int, int]:
+    def _pad_to_square(self, img: np.ndarray) -> tuple[np.ndarray, int, int]:
         h, w = img.shape[:2]
-        side = max(h, w) + 2 * _PAD_FALLBACK_BORDER_PX
-        canvas = np.full((side, side, 3), _PAD_FALLBACK_FILL, dtype=img.dtype)
+        side = max(h, w) + 2 * self._pad_border_px
+        canvas = np.full((side, side, 3), self._pad_fill, dtype=img.dtype)
         dy = (side - h) // 2
         dx = (side - w) // 2
         canvas[dy : dy + h, dx : dx + w] = img

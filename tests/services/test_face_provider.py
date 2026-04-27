@@ -338,8 +338,9 @@ class TestPadSquareFallback:
         assert mock_app.det_model.detect.call_count == 2
 
     def test_pad_to_square_square_input(self) -> None:
+        provider, _ = _create_provider_with_mock()
         img = np.full((100, 100, 3), 50, dtype=np.uint8)
-        padded, dx, dy = InsightFaceProvider._pad_to_square(img)
+        padded, dx, dy = provider._pad_to_square(img)
         assert padded.shape == (300, 300, 3)
         assert dx == 100
         assert dy == 100
@@ -347,9 +348,69 @@ class TestPadSquareFallback:
         assert padded[150, 150].tolist() == [50, 50, 50]  # original preserved at center
 
     def test_pad_to_square_non_square_input(self) -> None:
+        provider, _ = _create_provider_with_mock()
         # h=80, w=120 -> side = max(80, 120) + 200 = 320
         img = np.zeros((80, 120, 3), dtype=np.uint8)
-        padded, dx, dy = InsightFaceProvider._pad_to_square(img)
+        padded, dx, dy = provider._pad_to_square(img)
         assert padded.shape == (320, 320, 3)
         assert dx == (320 - 120) // 2  # 100
         assert dy == (320 - 80) // 2  # 120
+
+    def test_pad_to_square_honours_configured_border_and_fill(self) -> None:
+        provider = InsightFaceProvider(use_gpu=False, pad_fallback_border_px=50, pad_fallback_fill=200)
+        img = np.zeros((100, 100, 3), dtype=np.uint8)
+        padded, dx, dy = provider._pad_to_square(img)
+        assert padded.shape == (200, 200, 3)
+        assert (dx, dy) == (50, 50)
+        assert padded[0, 0].tolist() == [200, 200, 200]
+
+    def test_alignment_uses_padded_image_not_original(self) -> None:
+        # Regression guard: when the fallback fires, _align_and_embed must
+        # receive the padded canvas (300x300) so warpAffine samples gray
+        # padding past the original edges, not the (100x100) original.
+        provider, mock_app = _create_provider_with_mock()
+        retry_hit = _make_det_output([{"bbox": [110.0, 120.0, 180.0, 190.0], "det_score": 0.95}])
+        mock_app.det_model.detect.side_effect = [_empty_det_output(), retry_hit]
+
+        captured: list[np.ndarray] = []
+
+        def fake_align(img: np.ndarray, kpss: np.ndarray) -> np.ndarray:
+            captured.append(img)
+            return np.zeros((kpss.shape[0], 512), dtype=np.float32)
+
+        provider._align_and_embed = fake_align  # type: ignore[method-assign]
+
+        provider.embed(_fake_image_bytes())
+
+        assert len(captured) == 1
+        assert captured[0].shape == (300, 300, 3)
+
+    def test_analyze_batch_fallback_per_image(self) -> None:
+        # Mirror of test_embed_batch_fallback_per_image for the analyze path.
+        provider, mock_app = _create_provider_with_mock()
+        first_hit = _make_det_output()
+        retry_hit = _make_det_output([{"bbox": [110.0, 120.0, 180.0, 190.0], "det_score": 0.9}])
+        mock_app.det_model.detect.side_effect = [first_hit, _empty_det_output(), retry_hit]
+        mock_app.models["recognition"].get_feat.return_value = np.random.randn(2, 512).astype(np.float32)
+
+        mock_ga = MagicMock()
+
+        def fake_ga_get(img: object, face: object) -> tuple[int, int]:
+            face["gender"] = 1  # type: ignore[index]
+            face["age"] = 40
+            return 1, 40
+
+        mock_ga.get.side_effect = fake_ga_get
+        mock_app.models["genderage"] = mock_ga
+
+        results = provider.analyze_batch([_fake_image_bytes(), _fake_image_bytes()])
+
+        assert len(results) == 2
+        assert len(results[0]) == 1
+        assert results[0][0].bbox.x == 10.0  # first image: untranslated
+        assert len(results[1]) == 1
+        assert results[1][0].bbox.x == 10.0  # second image: translated from padded coords
+        assert results[1][0].bbox.y == 20.0
+        assert results[1][0].age == 40.0
+        assert results[1][0].gender == "male"
+        assert mock_app.det_model.detect.call_count == 3
