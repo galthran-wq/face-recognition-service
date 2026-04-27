@@ -25,6 +25,7 @@ from src.schemas.faces import (
     EmbedFaceSchema,
     EmbedResponse,
     ImageRequest,
+    LandmarkPoint,
 )
 from src.services.face_provider.base import DetectedFace, FaceProvider
 
@@ -47,12 +48,27 @@ def _bbox_schema(face: DetectedFace) -> BoundingBoxSchema:
     return BoundingBoxSchema(x=face.bbox.x, y=face.bbox.y, width=face.bbox.width, height=face.bbox.height)
 
 
+def _landmarks_schema(face: DetectedFace) -> list[LandmarkPoint] | None:
+    if face.landmarks is None:
+        return None
+    return [LandmarkPoint(x=x, y=y) for x, y in face.landmarks]
+
+
 def _to_detect_schema(face: DetectedFace) -> DetectFaceSchema:
-    return DetectFaceSchema(bbox=_bbox_schema(face), det_score=face.det_score)
+    return DetectFaceSchema(
+        bbox=_bbox_schema(face),
+        det_score=face.det_score,
+        landmarks=_landmarks_schema(face),
+    )
 
 
 def _to_embed_schema(face: DetectedFace) -> EmbedFaceSchema:
-    return EmbedFaceSchema(bbox=_bbox_schema(face), det_score=face.det_score, embedding=face.embedding or [])
+    return EmbedFaceSchema(
+        bbox=_bbox_schema(face),
+        det_score=face.det_score,
+        embedding=face.embedding or [],
+        landmarks=_landmarks_schema(face),
+    )
 
 
 def _to_analyze_schema(face: DetectedFace) -> AnalyzeFaceSchema:
@@ -64,6 +80,7 @@ def _to_analyze_schema(face: DetectedFace) -> AnalyzeFaceSchema:
         gender=face.gender,
         race=face.race,
         race_probs=face.race_probs,
+        landmarks=_landmarks_schema(face),
     )
 
 

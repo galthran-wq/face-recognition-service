@@ -19,6 +19,7 @@ class DetectedFace:
     gender: str | None = None
     race: str | None = None
     race_probs: dict[str, float] | None = field(default=None)
+    landmarks: list[tuple[float, float]] | None = None
 
 
 class FaceProvider(ABC):
