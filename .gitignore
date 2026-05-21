@@ -13,3 +13,10 @@ coverage.xml
 htmlcov/
 .ruff_cache/
 *.egg
+
+# deploy/vastai runtime state — pid/log files, generated configs, TRT engine caches
+deploy/vastai/run/
+deploy/vastai/logs/
+deploy/vastai/trt_cache/
+deploy/vastai/caddy_lb.generated.conf
+deploy/vastai/cloudflared.generated.yml
