@@ -10,6 +10,50 @@ from src.services.face_provider.base import BoundingBox, DetectedFace, FaceProvi
 
 _BATCH_THREAD_WORKERS = 4
 
+
+def _trt_batch_profile(model_path: str, opt_batch: int, max_batch: int) -> dict[str, str]:
+    """Build TRT optimization-profile options for a dynamic-batch model.
+
+    Matches models whose first input dim is a dynamic batch and whose remaining
+    dims are static (recognition `Nx3x112x112`, genderage `Nx3x96x96`). Returns
+    ``{}`` for anything else — notably the detector, whose batch is fixed at 1
+    and whose spatial dims are dynamic — so their TRT behavior is unchanged.
+
+    With these options the TensorRT EP builds one engine spanning batch
+    ``[1, max_batch]`` (cached to disk) instead of rebuilding a fresh engine the
+    first time it sees each distinct batch size (~30-75 s, in-process only).
+    """
+    try:
+        import onnx  # noqa: PLC0415
+
+        model = onnx.load(model_path, load_external_data=False)
+    except Exception:  # noqa: BLE001 — never block model load on profile probing
+        return {}
+
+    mins: list[str] = []
+    opts: list[str] = []
+    maxs: list[str] = []
+    for inp in model.graph.input:
+        dims = inp.type.tensor_type.shape.dim
+        if len(dims) < 2:
+            continue
+        batch_dynamic = dims[0].dim_value == 0  # 0 == symbolic / unknown
+        rest_static = all(d.dim_value > 0 for d in dims[1:])
+        if not (batch_dynamic and rest_static):
+            continue
+        static = "x".join(str(d.dim_value) for d in dims[1:])
+        mins.append(f"{inp.name}:1x{static}")
+        opts.append(f"{inp.name}:{opt_batch}x{static}")
+        maxs.append(f"{inp.name}:{max_batch}x{static}")
+    if not mins:
+        return {}
+    return {
+        "trt_profile_min_shapes": ",".join(mins),
+        "trt_profile_opt_shapes": ",".join(opts),
+        "trt_profile_max_shapes": ",".join(maxs),
+    }
+
+
 # Pad-to-square fallback: RetinaFace anchors miss faces that fill most of the
 # frame. Padding to a square with a gray border restores typical face-to-frame
 # ratio so anchors can match again. Applied transparently when the first
@@ -73,6 +117,8 @@ class InsightFaceProvider(FaceProvider):
         model_dir: str = "~/.insightface",
         use_tensorrt: bool = False,
         trt_cache_path: str = "/models/trt_cache",
+        trt_max_batch: int = 256,
+        trt_opt_batch: int = 16,
         pad_fallback_border_px: int = 100,
         pad_fallback_fill: int = 128,
     ) -> None:
@@ -83,6 +129,8 @@ class InsightFaceProvider(FaceProvider):
         self._model_dir = model_dir
         self._use_tensorrt = use_tensorrt
         self._trt_cache_path = trt_cache_path
+        self._trt_max_batch = trt_max_batch
+        self._trt_opt_batch = trt_opt_batch
         self._pad_border_px = pad_fallback_border_px
         self._pad_fill = pad_fallback_fill
         self._app: Any = None
@@ -99,6 +147,9 @@ class InsightFaceProvider(FaceProvider):
         # FaceAnalysis only forwards `providers` and `provider_options` to sessions,
         # not `sess_options` (model_zoo.py:94-96). This patch fills the gap.
         _original_init = PickableInferenceSession.__init__
+        _trt_on = self._use_gpu and self._use_tensorrt
+        _opt_batch = self._trt_opt_batch
+        _max_batch = self._trt_max_batch
 
         def _patched_init(self_sess: PickableInferenceSession, model_path: str, **kwargs: Any) -> None:
             if "sess_options" not in kwargs:
@@ -108,6 +159,20 @@ class InsightFaceProvider(FaceProvider):
                 so.enable_mem_pattern = True
                 so.enable_mem_reuse = True
                 kwargs["sess_options"] = so
+            # Give dynamic-batch models (recognition, genderage) a TRT optimization
+            # profile so one engine covers batch [1, max] instead of rebuilding per
+            # face-count. Scoped per session via model_path: the detector and the
+            # recognizer share input name 'input.1' with incompatible shapes, so a
+            # global profile would break the detector — we copy provider_options
+            # and only amend the session whose model actually has a dynamic batch.
+            if _trt_on and _max_batch > 0 and "providers" in kwargs and "provider_options" in kwargs:
+                profile = _trt_batch_profile(model_path, _opt_batch, _max_batch)
+                providers = list(kwargs["providers"])
+                if profile and "TensorrtExecutionProvider" in providers:
+                    idx = providers.index("TensorrtExecutionProvider")
+                    opts = [dict(o) for o in kwargs["provider_options"]]
+                    opts[idx] = {**opts[idx], **profile}
+                    kwargs["provider_options"] = opts
             _original_init(self_sess, model_path, **kwargs)
 
         PickableInferenceSession.__init__ = _patched_init
@@ -203,13 +268,25 @@ class InsightFaceProvider(FaceProvider):
             y2 = max(0.0, min(y2, max_h))
         return BoundingBox(x=x1, y=y1, width=max(0.0, x2 - x1), height=max(0.0, y2 - y1))
 
+    def _recognize(self, rec_model: Any, crops: list[np.ndarray]) -> np.ndarray:
+        """Run recognition on face crops, chunked so the batch dimension never
+        exceeds the TRT optimization-profile maximum. Without chunking a request
+        with more faces than ``trt_max_batch`` would fall outside the profile and
+        either error or trigger a per-shape engine rebuild.
+        """
+        max_b = self._trt_max_batch
+        if max_b <= 0 or len(crops) <= max_b:
+            return rec_model.get_feat(crops)  # type: ignore[no-any-return]
+        feats = [rec_model.get_feat(crops[i : i + max_b]) for i in range(0, len(crops), max_b)]
+        return np.concatenate(feats, axis=0)
+
     def _align_and_embed(self, img: np.ndarray, kpss: np.ndarray) -> np.ndarray:
         rec_model = self._app.models["recognition"]
         crops = []
         for kps in kpss:
             aimg = _norm_crop(img, landmark=kps, image_size=rec_model.input_size[0])
             crops.append(aimg)
-        embeddings: np.ndarray = rec_model.get_feat(crops)
+        embeddings: np.ndarray = self._recognize(rec_model, crops)
         norms = np.linalg.norm(embeddings, axis=1, keepdims=True)
         norms = np.maximum(norms, 1e-10)
         normalized: np.ndarray = embeddings / norms
@@ -344,7 +421,7 @@ class InsightFaceProvider(FaceProvider):
                 all_crops = list(pool.map(lambda t: _norm_crop(t[0], t[1], image_size), align_tasks))
 
         if all_crops:
-            all_embeddings: np.ndarray = rec_model.get_feat(all_crops)
+            all_embeddings: np.ndarray = self._recognize(rec_model, all_crops)
             norms = np.linalg.norm(all_embeddings, axis=1, keepdims=True)
             norms = np.maximum(norms, 1e-10)
             all_embeddings = all_embeddings / norms
@@ -408,7 +485,7 @@ class InsightFaceProvider(FaceProvider):
                 all_crops = list(pool.map(lambda t: _norm_crop(t[0], t[1], image_size), align_tasks))
 
         if all_crops:
-            all_embeddings: np.ndarray = rec_model.get_feat(all_crops)
+            all_embeddings: np.ndarray = self._recognize(rec_model, all_crops)
             norms = np.linalg.norm(all_embeddings, axis=1, keepdims=True)
             norms = np.maximum(norms, 1e-10)
             all_embeddings = all_embeddings / norms
