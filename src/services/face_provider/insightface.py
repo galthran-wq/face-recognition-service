@@ -151,6 +151,20 @@ class InsightFaceProvider(FaceProvider):
         _opt_batch = self._trt_opt_batch
         _max_batch = self._trt_max_batch
 
+        # Optional per-session ORT thread caps. ORT defaults intra_op_num_threads
+        # to nproc *per session*; on a many-core host running N instances each
+        # loading several sessions this explodes to thousands of OS threads
+        # thrashing the scheduler. Observed: 16 instances × 5 sessions × 56-core
+        # host → 362 threads/instance, ~5800 total, kernel scheduler chokes,
+        # per-request latency goes to seconds even with the GPU at 20% util. Set
+        # FACE_INTRA_OP_THREADS / FACE_INTER_OP_THREADS (typically 2 and 1) to
+        # cap; on the same box this collapsed thread count to ~70/instance and
+        # restored sub-100 ms warm latency.
+        import os as _os  # noqa: PLC0415
+
+        _intra = int(_os.environ.get("FACE_INTRA_OP_THREADS", "0"))
+        _inter = int(_os.environ.get("FACE_INTER_OP_THREADS", "0"))
+
         def _patched_init(self_sess: PickableInferenceSession, model_path: str, **kwargs: Any) -> None:
             if "sess_options" not in kwargs:
                 so = ort.SessionOptions()
@@ -158,6 +172,10 @@ class InsightFaceProvider(FaceProvider):
                 so.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
                 so.enable_mem_pattern = True
                 so.enable_mem_reuse = True
+                if _intra > 0:
+                    so.intra_op_num_threads = _intra
+                if _inter > 0:
+                    so.inter_op_num_threads = _inter
                 kwargs["sess_options"] = so
             # Give dynamic-batch models (recognition, genderage) a TRT optimization
             # profile so one engine covers batch [1, max] instead of rebuilding per
