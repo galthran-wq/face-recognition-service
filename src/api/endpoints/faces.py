@@ -26,6 +26,7 @@ from src.schemas.faces import (
     EmbedResponse,
     ImageRequest,
     LandmarkPoint,
+    PoseSchema,
 )
 from src.services.face_provider.base import DetectedFace, FaceProvider
 
@@ -54,11 +55,18 @@ def _landmarks_schema(face: DetectedFace) -> list[LandmarkPoint] | None:
     return [LandmarkPoint(x=x, y=y) for x, y in face.landmarks]
 
 
+def _pose_schema(face: DetectedFace) -> PoseSchema | None:
+    if face.pose is None:
+        return None
+    return PoseSchema(pitch=face.pose.pitch, yaw=face.pose.yaw, roll=face.pose.roll)
+
+
 def _to_detect_schema(face: DetectedFace) -> DetectFaceSchema:
     return DetectFaceSchema(
         bbox=_bbox_schema(face),
         det_score=face.det_score,
         landmarks=_landmarks_schema(face),
+        pose=_pose_schema(face),
     )
 
 

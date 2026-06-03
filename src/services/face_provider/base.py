@@ -11,6 +11,13 @@ class BoundingBox:
 
 
 @dataclass(frozen=True, slots=True)
+class HeadPose:
+    pitch: float
+    yaw: float
+    roll: float
+
+
+@dataclass(frozen=True, slots=True)
 class DetectedFace:
     bbox: BoundingBox
     det_score: float
@@ -20,6 +27,7 @@ class DetectedFace:
     race: str | None = None
     race_probs: dict[str, float] | None = field(default=None)
     landmarks: list[tuple[float, float]] | None = None
+    pose: HeadPose | None = None
 
 
 class FaceProvider(ABC):
