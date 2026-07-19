@@ -80,6 +80,28 @@ class TestInsightFaceProviderDetect:
         faces = provider.detect(_fake_image_bytes())
         assert faces == []
 
+    def test_detect_returns_pose_when_model_present(self) -> None:
+        provider, mock_app = _create_provider_with_mock()
+
+        mock_pose = MagicMock()
+
+        def fake_pose_get(img: object, face: object) -> None:
+            face["pose"] = np.array([5.0, 10.0, -3.0], dtype=np.float32)  # pitch, yaw, roll
+
+        mock_pose.get.side_effect = fake_pose_get
+        mock_app.models["landmark_3d_68"] = mock_pose
+
+        faces = provider.detect(_fake_image_bytes())
+        assert faces[0].pose is not None
+        assert faces[0].pose.pitch == pytest.approx(5.0)
+        assert faces[0].pose.yaw == pytest.approx(10.0)
+        assert faces[0].pose.roll == pytest.approx(-3.0)
+
+    def test_detect_pose_none_without_model(self) -> None:
+        provider, _mock_app = _create_provider_with_mock()
+        faces = provider.detect(_fake_image_bytes())
+        assert faces[0].pose is None
+
 
 class TestInsightFaceProviderEmbed:
     def test_embed_returns_embedding_no_demographics(self) -> None:

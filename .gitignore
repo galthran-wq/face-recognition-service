@@ -13,3 +13,7 @@ coverage.xml
 htmlcov/
 .ruff_cache/
 *.egg
+
+# head-pose benchmark dataset (not committed)
+benchmarks/data/
+benchmarks/results/

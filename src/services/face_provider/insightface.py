@@ -6,7 +6,7 @@ from typing import Any
 import cv2
 import numpy as np
 
-from src.services.face_provider.base import BoundingBox, DetectedFace, FaceProvider
+from src.services.face_provider.base import BoundingBox, DetectedFace, FaceProvider, HeadPose
 
 _BATCH_THREAD_WORKERS = 4
 
@@ -104,6 +104,16 @@ def _to_float(v: Any) -> float | None:
         return float(v)
     except (TypeError, ValueError):
         return None
+
+
+def _to_pose(raw: object) -> HeadPose | None:
+    """InsightFace's 1k3d68 stores pose as [pitch, yaw, roll] (degrees)."""
+    if raw is None:
+        return None
+    arr = np.asarray(raw, dtype=np.float32)
+    if arr.shape != (3,):
+        return None
+    return HeadPose(pitch=float(arr[0]), yaw=float(arr[1]), roll=float(arr[2]))
 
 
 class InsightFaceProvider(FaceProvider):
@@ -300,21 +310,35 @@ class InsightFaceProvider(FaceProvider):
             return [(float(p[0]) - dx, float(p[1]) - dy) for p in kps]
         return [(float(p[0]), float(p[1])) for p in kps]
 
+    def _estimate_poses(self, img: np.ndarray, bboxes: np.ndarray, kpss: np.ndarray | None) -> list[HeadPose | None]:
+        """Real head pose via the 1k3d68 landmark model (detect + pose only, no recognition)."""
+        pose_model = self._app.models.get("landmark_3d_68")
+        if pose_model is None:
+            return [None] * bboxes.shape[0]
+        poses: list[HeadPose | None] = []
+        for i in range(bboxes.shape[0]):
+            face_obj = _FaceProxy(bbox=bboxes[i, :4], kps=kpss[i] if kpss is not None else None)
+            pose_model.get(img, face_obj)
+            poses.append(_to_pose(face_obj.get("pose")))
+        return poses
+
     def detect(self, image_bytes: bytes) -> list[DetectedFace]:
         img = self._decode_image(image_bytes)
         if img is None:
             return []
 
-        bboxes, kpss, _working, dx, dy = self._detect_with_pad_fallback(img)
+        bboxes, kpss, working, dx, dy = self._detect_with_pad_fallback(img)
         if bboxes.shape[0] == 0:
             return []
 
+        poses = self._estimate_poses(working, bboxes, kpss)
         orig_h, orig_w = img.shape[:2]
         return [
             DetectedFace(
                 bbox=self._make_bbox(bboxes[i, :4], dx, dy, orig_w, orig_h),
                 det_score=float(bboxes[i, 4]),
                 landmarks=self._kps_to_landmarks(kpss[i] if kpss is not None else None, dx, dy),
+                pose=poses[i],
             )
             for i in range(bboxes.shape[0])
         ]

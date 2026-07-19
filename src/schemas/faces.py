@@ -26,6 +26,12 @@ class LandmarkPoint(BaseModel):
     y: float
 
 
+class PoseSchema(BaseModel):
+    pitch: float
+    yaw: float
+    roll: float
+
+
 # --- Per-endpoint face schemas ---
 
 
@@ -33,6 +39,7 @@ class DetectFaceSchema(BaseModel):
     bbox: BoundingBoxSchema
     det_score: float
     landmarks: list[LandmarkPoint] | None = None
+    pose: PoseSchema | None = None
 
 
 class EmbedFaceSchema(DetectFaceSchema):
