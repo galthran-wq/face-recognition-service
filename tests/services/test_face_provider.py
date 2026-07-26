@@ -44,6 +44,21 @@ def _create_provider_with_mock() -> tuple[InsightFaceProvider, MagicMock]:
     return provider, mock_app
 
 
+def _make_ga_mock(preds: list[list[float]]) -> MagicMock:
+    """Genderage mock for the batched session.run interface.
+
+    Each pred is [female_score, male_score, age/100] — one row per face.
+    """
+    mock_ga = MagicMock()
+    mock_ga.input_size = (96, 96)
+    mock_ga.input_std = 128.0
+    mock_ga.input_mean = 127.5
+    mock_ga.input_name = "data"
+    mock_ga.output_names = ["fc1"]
+    mock_ga.session.run.return_value = [np.array(preds, dtype=np.float32)]
+    return mock_ga
+
+
 def _fake_image_bytes() -> bytes:
     img = np.zeros((100, 100, 3), dtype=np.uint8)
     import cv2  # type: ignore[import-untyped]
@@ -115,16 +130,7 @@ class TestInsightFaceProviderAnalyze:
     def test_analyze_returns_all_fields(self) -> None:
         provider, mock_app = _create_provider_with_mock()
 
-        # Add genderage model mock
-        mock_ga = MagicMock()
-
-        def fake_ga_get(img: object, face: object) -> tuple[int, int]:
-            face["gender"] = 0  # female
-            face["age"] = 25
-            return 0, 25
-
-        mock_ga.get.side_effect = fake_ga_get
-        mock_app.models["genderage"] = mock_ga
+        mock_app.models["genderage"] = _make_ga_mock([[0.9, 0.1, 0.25]])  # female, age 25
 
         faces = provider.analyze(_fake_image_bytes())
 
@@ -138,19 +144,22 @@ class TestInsightFaceProviderAnalyze:
 
     def test_analyze_male_gender(self) -> None:
         provider, mock_app = _create_provider_with_mock()
-
-        mock_ga = MagicMock()
-
-        def fake_ga_get(img: object, face: object) -> tuple[int, int]:
-            face["gender"] = 1  # male
-            face["age"] = 30
-            return 1, 30
-
-        mock_ga.get.side_effect = fake_ga_get
-        mock_app.models["genderage"] = mock_ga
+        mock_app.models["genderage"] = _make_ga_mock([[0.1, 0.9, 0.30]])  # male, age 30
 
         faces = provider.analyze(_fake_image_bytes())
         assert faces[0].gender == "male"
+
+    def test_analyze_without_attributes_skips_genderage(self) -> None:
+        provider, mock_app = _create_provider_with_mock()
+        mock_ga = _make_ga_mock([[0.1, 0.9, 0.30]])
+        mock_app.models["genderage"] = mock_ga
+
+        faces = provider.analyze(_fake_image_bytes(), with_attributes=False)
+
+        assert faces[0].age is None
+        assert faces[0].gender is None
+        assert faces[0].embedding is not None
+        mock_ga.session.run.assert_not_called()
 
 
 class TestInsightFaceProviderLoadModel:
@@ -290,15 +299,7 @@ class TestPadSquareFallback:
 
     def test_analyze_fallback_returns_translated_bbox_with_demographics(self) -> None:
         provider, mock_app = _create_provider_with_mock()
-        mock_ga = MagicMock()
-
-        def fake_ga_get(img: object, face: object) -> tuple[int, int]:
-            face["gender"] = 1  # type: ignore[index]
-            face["age"] = 33  # type: ignore[index]
-            return 1, 33
-
-        mock_ga.get.side_effect = fake_ga_get
-        mock_app.models["genderage"] = mock_ga
+        mock_app.models["genderage"] = _make_ga_mock([[0.1, 0.9, 0.33]])  # male, age 33
 
         retry_hit = _make_det_output([{"bbox": [110.0, 120.0, 180.0, 190.0], "det_score": 0.95}])
         mock_app.det_model.detect.side_effect = [_empty_det_output(), retry_hit]
@@ -393,15 +394,8 @@ class TestPadSquareFallback:
         mock_app.det_model.detect.side_effect = [first_hit, _empty_det_output(), retry_hit]
         mock_app.models["recognition"].get_feat.return_value = np.random.randn(2, 512).astype(np.float32)
 
-        mock_ga = MagicMock()
-
-        def fake_ga_get(img: object, face: object) -> tuple[int, int]:
-            face["gender"] = 1  # type: ignore[index]
-            face["age"] = 40
-            return 1, 40
-
-        mock_ga.get.side_effect = fake_ga_get
-        mock_app.models["genderage"] = mock_ga
+        # Two faces total (one per image) — one pred row each.
+        mock_app.models["genderage"] = _make_ga_mock([[0.1, 0.9, 0.40], [0.1, 0.9, 0.40]])
 
         results = provider.analyze_batch([_fake_image_bytes(), _fake_image_bytes()])
 

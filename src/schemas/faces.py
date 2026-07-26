@@ -11,6 +11,16 @@ class BatchRequest(BaseModel):
     images: list[ImageRequest]
 
 
+class AnalyzeRequest(ImageRequest):
+    # Set to False to skip the genderage model (age/gender come back as null);
+    # saves ~17% of per-request compute when attributes aren't needed.
+    attributes: bool = True
+
+
+class AnalyzeBatchRequest(BatchRequest):
+    attributes: bool = True
+
+
 # --- Shared schemas ---
 
 

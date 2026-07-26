@@ -4,6 +4,7 @@ from contextlib import asynccontextmanager
 
 import structlog
 from fastapi import FastAPI
+from fastapi.responses import ORJSONResponse
 
 from src.api.router import router
 from src.config import settings
@@ -48,6 +49,9 @@ def create_app() -> FastAPI:
         title=settings.app_name,
         debug=settings.debug,
         lifespan=lifespan,
+        # orjson serializes the large float payloads (512-dim embeddings per
+        # face) in C — stdlib json.iterencode was ~24% of GIL time under load.
+        default_response_class=ORJSONResponse,
     )
     register_middleware(application)
     register_exception_handlers(application)

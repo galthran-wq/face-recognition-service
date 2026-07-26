@@ -184,12 +184,79 @@ batch limit from 20 to 64.
 - Dockerfile.gpu includes `tensorrt-cu12-libs==10.7.0` for CUDA 12.x compatibility
 - Falls back to CUDA EP automatically for any unsupported ops
 
-## Remaining optimization opportunities
+## Round 4: the host is the ceiling (2026-07-26, 4x RTX 4090 / dual Xeon E5-2680 v4)
 
-### Medium effort
+A day of A/B testing on the production box established that **throughput is capped by the
+host, not by the GPUs or the service code**. Every per-process optimization landed on the
+same ~205-215 RPS ceiling for `/faces/analyze` via the LB (8 instances, 2/GPU):
+
+| Change | analyze RPS @ C=96 |
+|---|---:|
+| Baseline (sem=1, no MPS) | 213 |
+| Inference semaphore 2 + CUDA MPS | 209 |
+| 3 instances/GPU (with MPS, all clients M+C) | 185 (worse) |
+| Batched genderage (1 ONNX call vs 6) | 203 |
+| `attributes=false` (genderage fully off) | 202 |
+| orjson responses (iterencode was 24% of GIL time) | 201 |
+| CPU governor schedutil→performance (1.67→2.4 GHz) | ~same |
+| `analyze/batch` batch=8/16 (img/s) | 214-222 |
+
+The smoking gun is scaling behavior with dedicated GPUs per instance:
+
+| Active instances | RPS per instance |
+|---|---:|
+| 1 (solo, own GPU) | **83** |
+| 4 (one per GPU) | **57** |
+| 8 (two per GPU) | **30** |
+
+Instances slow each other down even on separate GPUs — a host-global shared resource.
+Ruled out: Caddy (direct-port tests), the load client (two parallel clients), CUDA context
+time-slicing (MPS on/off identical), CPU cores (56 threads, ~78% idle), clock throttling
+(governor fix changed nothing), MPS server. Remaining explanation: the memory subsystem —
+the box runs dual Broadwell with **BIOS node interleaving (OS sees 1 NUMA node)**, so ~50%
+of every memory access and all GPU DMA cross QPI; per-image work (JPEG decode, detector
+pre/post, h11 body handling) contends there. GPU util never exceeds ~25% because the host
+cannot feed 4x4090s.
+
+GIL profile at saturation (py-spy --gil): GIL held only ~45% — json `iterencode` 24%
+(fixed with orjson), pydantic dump ~6%, b64decode ~4%. The rest of request time is
+GIL-released C code (ORT, cv2) slowed by the shared memory subsystem.
+
+### What actually remains
+
+1. **BIOS: disable node interleaving (enable NUMA)** + pin instances/memory per socket
+   (`numactl --cpunodebind --membind`). Requires console access + reboot. This attacks the
+   diagnosed bottleneck directly.
+2. **GPU JPEG decode (nvJPEG/DALI).** Kills the decode CPU cost *and* shrinks PCIe/QPI DMA
+   ~17x (transfer ~200 KB JPEG instead of ~3.4 MB raw BGR per image). Unusually valuable
+   on this host.
+3. **Cross-request micro-batching GPU worker** (one per GPU, HTTP processes feed it):
+   divides per-image host overhead (Run calls, copies, launches) by the batch size.
+   Recognition alone does 5,880 faces/s at batch=32 — the models have ~25x headroom over
+   the ~1,300 faces/s the host currently delivers.
+4. **Dynamic-batch SCRFD re-export** — prerequisite for (3) to batch detection.
+5. Hardware note: a dual-Broadwell host is the wrong CPU:GPU ratio for 4x4090. On a modern
+   single-socket host (or with NUMA fixed) the same code should go substantially past the
+   current ceiling.
+
+### Also shipped in round 4
+
+- `FACE_INFERENCE_CONCURRENCY` (in-flight inferences per process, default 2).
+- `FACE_CUDA_GPU_MEM_LIMIT_GB` (CUDA EP arena cap; default 2 GiB in the launcher) — bounds
+  the grow-and-never-shrink arena that previously forced 2/GPU for safety.
+- CUDA MPS management in `run_instances.sh` (`MPS_ENABLE`, default on when available) —
+  neutral for throughput here but harmless; keeps kernels from different instances truly
+  concurrent.
+- Batched genderage (one `session.run` per image/batch instead of per face) — verified
+  bit-identical age/gender on buffalo_l vs the per-face path.
+- `attributes: false` request flag on `/faces/analyze[/batch]` to skip genderage entirely.
+- orjson response serialization.
+
+### Older items (still valid)
 
 1. **Concurrent detection + recognition.** Detection for image N+1 can overlap with
    recognition for image N using CUDA streams. Would reduce batch latency by ~30%.
 
 2. **INT8 quantization.** Expected 2-4x over FP32 but requires calibration dataset
-   and accuracy validation. Diminishing returns given TRT FP16 already provides major gains.
+   and accuracy validation. Diminishing returns given TRT FP16 already provides major gains
+   — and irrelevant while the host, not the GPU, is the bottleneck.

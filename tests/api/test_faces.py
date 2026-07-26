@@ -81,6 +81,15 @@ async def test_analyze_single(client: AsyncClient) -> None:
     assert "race_probs" in face
 
 
+async def test_analyze_single_without_attributes(client: AsyncClient) -> None:
+    resp = await client.post("/faces/analyze", json={"image_b64": _TINY_PNG, "attributes": False})
+    assert resp.status_code == 200
+    face = resp.json()["faces"][0]
+    assert face["age"] is None
+    assert face["gender"] is None
+    assert face["embedding"]
+
+
 async def test_analyze_invalid_base64(client: AsyncClient) -> None:
     resp = await client.post("/faces/analyze", json={"image_b64": _INVALID_B64})
     assert resp.status_code == 400

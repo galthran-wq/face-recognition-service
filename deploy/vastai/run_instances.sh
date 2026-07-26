@@ -12,6 +12,9 @@
 #
 # Environment overrides:
 #   FACE_MODEL_DIR        Where InsightFace caches model files (default: /root/.insightface)
+#   FACE_INFERENCE_CONCURRENCY  In-flight inferences per instance (default: 2)
+#   FACE_CUDA_GPU_MEM_LIMIT_GB  CUDA EP arena cap per instance, GiB (default: 2; 0 = unlimited)
+#   MPS_ENABLE            0 to skip CUDA MPS daemon (default: 1 if nvidia-cuda-mps-control found)
 #   LB_PORT               Internal port for the Caddy LB (default: 7999)
 #   CLOUDFLARED_BIN       Path to cloudflared (default: search PATH then vast portal path)
 #   CLOUDFLARED_ENABLE    Set to 0 to skip Cloudflare tunnel (default: 1 if cert.pem exists)
@@ -52,21 +55,27 @@ TRT_DIR="$SCRIPT_DIR/trt_cache"
 mkdir -p "$LOG_DIR" "$PID_DIR" "$TRT_DIR"
 
 # ── Topology: instance_id  gpu_index  local_port (loopback)
-#    Default: 3 instances per GPU on a 3-GPU host. Edit freely.
+#    Local deploy: 4x RTX 4090 (24 GiB each), 2 instances/GPU = 8 total.
+#    The unbounded-arena OOM risk is now bounded by FACE_CUDA_GPU_MEM_LIMIT_GB
+#    (default 2 GiB/instance, set in start_one), so 3/GPU should be safe:
+#    3 × (~0.6 GiB model+engines + 2 GiB arena cap) ≈ 8 GiB/GPU worst case.
+#    2/GPU is the measured sweet spot on this host. 3/GPU retested 2026-07-26
+#    WITH MPS active (all clients M+C) and an arena cap: still worse than
+#    2/GPU (185 vs 213 RPS analyze @ C=96) — density loss is not context
+#    time-slicing; concurrent small kernels just stretch each other out.
 INSTANCES=(
   "gpu0-a 0 11113"
   "gpu0-b 0 11114"
-  "gpu0-c 0 11115"
-  "gpu1-a 1 11119"
-  "gpu1-b 1 11120"
-  "gpu1-c 1 11121"
-  "gpu2-a 2 11125"
-  "gpu2-b 2 11126"
-  "gpu2-c 2 11127"
+  "gpu1-a 1 11116"
+  "gpu1-b 1 11117"
+  "gpu2-a 2 11119"
+  "gpu2-b 2 11120"
+  "gpu3-a 3 11122"
+  "gpu3-b 3 11123"
 )
 
 # ── Config knobs
-FACE_MODEL_DIR="${FACE_MODEL_DIR:-/root/.insightface}"
+FACE_MODEL_DIR="${FACE_MODEL_DIR:-$HOME/.insightface}"
 LB_PORT="${LB_PORT:-7999}"
 CLOUDFLARED_DOMAIN="${CLOUDFLARED_DOMAIN:-infected.life}"
 CLOUDFLARED_TUNNEL="${CLOUDFLARED_TUNNEL:-face-recognition-pool}"
@@ -185,6 +194,48 @@ provision_dns() {
   done
 }
 
+# ── CUDA MPS (optional, on by default when the binary is present)
+# Without MPS, kernels from different processes sharing a GPU time-slice
+# between CUDA contexts and never overlap — N instances add up GPU *busy time*
+# but can't fill the SMs concurrently. The MPS control daemon funnels all
+# clients through one context per GPU so their kernels genuinely run in
+# parallel. Disable with MPS_ENABLE=0.
+MPS_DIR="$PID_DIR/mps"
+MPS_BIN="${MPS_BIN:-$(command -v nvidia-cuda-mps-control || true)}"
+MPS_ENABLE="${MPS_ENABLE:-$([[ -n "$MPS_BIN" ]] && echo 1 || echo 0)}"
+
+start_mps() {
+  [[ "$MPS_ENABLE" == "1" ]] || return 0
+  if [[ -z "$MPS_BIN" ]]; then
+    echo "[mps] nvidia-cuda-mps-control not found — running without MPS"
+    return 0
+  fi
+  mkdir -p "$MPS_DIR/pipe" "$MPS_DIR/log"
+  # Exported here so every instance started afterwards inherits them and
+  # connects to this daemon instead of creating its own CUDA context.
+  export CUDA_MPS_PIPE_DIRECTORY="$MPS_DIR/pipe"
+  export CUDA_MPS_LOG_DIRECTORY="$MPS_DIR/log"
+  if echo get_server_list | "$MPS_BIN" >/dev/null 2>&1; then
+    echo "[mps] control daemon already running"
+    return 0
+  fi
+  echo "[mps] starting control daemon (pipes: $CUDA_MPS_PIPE_DIRECTORY)"
+  if ! "$MPS_BIN" -d >/dev/null 2>&1; then
+    echo "[mps] daemon failed to start — running without MPS" >&2
+    unset CUDA_MPS_PIPE_DIRECTORY CUDA_MPS_LOG_DIRECTORY
+  fi
+}
+
+stop_mps() {
+  [[ -n "$MPS_BIN" && -d "$MPS_DIR/pipe" ]] || return 0
+  echo "[mps] stopping control daemon"
+  # `quit` blocks until every client disconnects — if any stray instance is
+  # still attached (e.g. after an INSTANCES resize) it would hang forever, so
+  # bound it and fall back to killing the daemon outright.
+  CUDA_MPS_PIPE_DIRECTORY="$MPS_DIR/pipe" CUDA_MPS_LOG_DIRECTORY="$MPS_DIR/log" \
+    timeout 15 "$MPS_BIN" <<<"quit" >/dev/null 2>&1 || pkill -f nvidia-cuda-mps || true
+}
+
 # ── Per-instance lifecycle
 start_one() {
   local name="$1" gpu="$2" port="$3"
@@ -200,16 +251,27 @@ start_one() {
   fi
 
   echo "[$name] starting on GPU $gpu, port $port (TRT cache: $trt_cache)"
+  # Cap per-session ORT threads so N instances on a many-core host don't blow up
+  # the scheduler. ORT defaults intra_op to nproc *per session*: 16 instances ×
+  # 5 sessions × 56 cores → ~5000 OS threads thrashing. Capping to 2/1 keeps it
+  # to ~25 threads per instance with no measurable inference penalty.
   CUDA_VISIBLE_DEVICES="$gpu" \
   FACE_USE_GPU=true \
   FACE_USE_TENSORRT=true \
   FACE_CTX_ID=0 \
   FACE_MODEL_DIR="$FACE_MODEL_DIR" \
   FACE_TRT_CACHE_PATH="$trt_cache" \
+  FACE_INTRA_OP_THREADS="${FACE_INTRA_OP_THREADS:-2}" \
+  FACE_INTER_OP_THREADS="${FACE_INTER_OP_THREADS:-1}" \
+  FACE_INFERENCE_CONCURRENCY="${FACE_INFERENCE_CONCURRENCY:-2}" \
+  FACE_CUDA_GPU_MEM_LIMIT_GB="${FACE_CUDA_GPU_MEM_LIMIT_GB:-2}" \
+  OMP_NUM_THREADS="${OMP_NUM_THREADS:-2}" \
+  OPENBLAS_NUM_THREADS="${OPENBLAS_NUM_THREADS:-2}" \
+  MKL_NUM_THREADS="${MKL_NUM_THREADS:-2}" \
   APP_NAME="face-recognition-$name" \
     nohup "$ROOT/.venv/bin/uvicorn" src.main:app \
       --app-dir "$ROOT" \
-      --host 127.0.0.1 --port "$port" \
+      --host 0.0.0.0 --port "$port" \
       --workers 1 \
       --log-level info \
       >>"$log" 2>&1 &
@@ -330,6 +392,7 @@ stop_tunnel() {
 cmd="${1:-start}"
 case "$cmd" in
   start)
+    start_mps
     for line in "${INSTANCES[@]}"; do
       # shellcheck disable=SC2086
       start_one $line
@@ -344,6 +407,11 @@ case "$cmd" in
       # shellcheck disable=SC2086
       stop_one $line
     done
+    # Catch instances orphaned by an INSTANCES resize: this launcher is the
+    # only thing running this app on the box, so anything left matching it
+    # is ours. Must happen before stop_mps or lingering clients hang `quit`.
+    pkill -f "uvicorn src.main:app --app-dir $ROOT" 2>/dev/null && sleep 2 || true
+    stop_mps
     ;;
   restart)
     "$0" stop

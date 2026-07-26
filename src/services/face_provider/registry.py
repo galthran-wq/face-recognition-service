@@ -21,6 +21,10 @@ def create_provider(settings: Settings) -> FaceProvider:
             model_dir=settings.face_model_dir,
             use_tensorrt=settings.face_use_tensorrt,
             trt_cache_path=settings.face_trt_cache_path,
+            trt_max_batch=settings.face_trt_max_batch,
+            trt_opt_batch=settings.face_trt_opt_batch,
+            trt_cuda_graph=settings.face_trt_cuda_graph,
+            cuda_gpu_mem_limit_gb=settings.face_cuda_gpu_mem_limit_gb,
             pad_fallback_border_px=settings.face_pad_fallback_border_px,
             pad_fallback_fill=settings.face_pad_fallback_fill,
         )

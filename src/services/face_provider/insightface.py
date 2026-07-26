@@ -10,6 +10,50 @@ from src.services.face_provider.base import BoundingBox, DetectedFace, FaceProvi
 
 _BATCH_THREAD_WORKERS = 4
 
+
+def _trt_batch_profile(model_path: str, opt_batch: int, max_batch: int) -> dict[str, str]:
+    """Build TRT optimization-profile options for a dynamic-batch model.
+
+    Matches models whose first input dim is a dynamic batch and whose remaining
+    dims are static (recognition `Nx3x112x112`, genderage `Nx3x96x96`). Returns
+    ``{}`` for anything else — notably the detector, whose batch is fixed at 1
+    and whose spatial dims are dynamic — so their TRT behavior is unchanged.
+
+    With these options the TensorRT EP builds one engine spanning batch
+    ``[1, max_batch]`` (cached to disk) instead of rebuilding a fresh engine the
+    first time it sees each distinct batch size (~30-75 s, in-process only).
+    """
+    try:
+        import onnx  # noqa: PLC0415
+
+        model = onnx.load(model_path, load_external_data=False)
+    except Exception:  # noqa: BLE001 — never block model load on profile probing
+        return {}
+
+    mins: list[str] = []
+    opts: list[str] = []
+    maxs: list[str] = []
+    for inp in model.graph.input:
+        dims = inp.type.tensor_type.shape.dim
+        if len(dims) < 2:
+            continue
+        batch_dynamic = dims[0].dim_value == 0  # 0 == symbolic / unknown
+        rest_static = all(d.dim_value > 0 for d in dims[1:])
+        if not (batch_dynamic and rest_static):
+            continue
+        static = "x".join(str(d.dim_value) for d in dims[1:])
+        mins.append(f"{inp.name}:1x{static}")
+        opts.append(f"{inp.name}:{opt_batch}x{static}")
+        maxs.append(f"{inp.name}:{max_batch}x{static}")
+    if not mins:
+        return {}
+    return {
+        "trt_profile_min_shapes": ",".join(mins),
+        "trt_profile_opt_shapes": ",".join(opts),
+        "trt_profile_max_shapes": ",".join(maxs),
+    }
+
+
 # Pad-to-square fallback: RetinaFace anchors miss faces that fill most of the
 # frame. Padding to a square with a gray border restores typical face-to-frame
 # ratio so anchors can match again. Applied transparently when the first
@@ -55,13 +99,6 @@ def _norm_crop(img: np.ndarray, landmark: np.ndarray, image_size: int = 112) -> 
     return cv2.warpAffine(img, mat, (image_size, image_size), borderValue=0.0)
 
 
-def _to_float(v: Any) -> float | None:
-    try:
-        return float(v)
-    except (TypeError, ValueError):
-        return None
-
-
 class InsightFaceProvider(FaceProvider):
     def __init__(
         self,
@@ -73,6 +110,10 @@ class InsightFaceProvider(FaceProvider):
         model_dir: str = "~/.insightface",
         use_tensorrt: bool = False,
         trt_cache_path: str = "/models/trt_cache",
+        trt_max_batch: int = 256,
+        trt_opt_batch: int = 16,
+        trt_cuda_graph: bool = False,
+        cuda_gpu_mem_limit_gb: float = 0.0,
         pad_fallback_border_px: int = 100,
         pad_fallback_fill: int = 128,
     ) -> None:
@@ -83,6 +124,10 @@ class InsightFaceProvider(FaceProvider):
         self._model_dir = model_dir
         self._use_tensorrt = use_tensorrt
         self._trt_cache_path = trt_cache_path
+        self._trt_max_batch = trt_max_batch
+        self._trt_opt_batch = trt_opt_batch
+        self._trt_cuda_graph = trt_cuda_graph
+        self._cuda_gpu_mem_limit_gb = cuda_gpu_mem_limit_gb
         self._pad_border_px = pad_fallback_border_px
         self._pad_fill = pad_fallback_fill
         self._app: Any = None
@@ -99,6 +144,19 @@ class InsightFaceProvider(FaceProvider):
         # FaceAnalysis only forwards `providers` and `provider_options` to sessions,
         # not `sess_options` (model_zoo.py:94-96). This patch fills the gap.
         _original_init = PickableInferenceSession.__init__
+        _trt_on = self._use_gpu and self._use_tensorrt
+        _opt_batch = self._trt_opt_batch
+        _max_batch = self._trt_max_batch
+
+        # Optional per-session ORT thread caps. ORT defaults intra_op to nproc
+        # *per session*; on a many-core host with N instances each loading
+        # several sessions this explodes to thousands of OS threads thrashing
+        # the scheduler. Set FACE_INTRA_OP_THREADS / FACE_INTER_OP_THREADS to
+        # cap (e.g. 2 and 1) when running multiple instances on the same box.
+        import os as _os  # noqa: PLC0415
+
+        _intra = int(_os.environ.get("FACE_INTRA_OP_THREADS", "0"))
+        _inter = int(_os.environ.get("FACE_INTER_OP_THREADS", "0"))
 
         def _patched_init(self_sess: PickableInferenceSession, model_path: str, **kwargs: Any) -> None:
             if "sess_options" not in kwargs:
@@ -107,7 +165,25 @@ class InsightFaceProvider(FaceProvider):
                 so.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
                 so.enable_mem_pattern = True
                 so.enable_mem_reuse = True
+                if _intra > 0:
+                    so.intra_op_num_threads = _intra
+                if _inter > 0:
+                    so.inter_op_num_threads = _inter
                 kwargs["sess_options"] = so
+            # Give dynamic-batch models (recognition, genderage) a TRT optimization
+            # profile so one engine covers batch [1, max] instead of rebuilding per
+            # face-count. Scoped per session via model_path: the detector and the
+            # recognizer share input name 'input.1' with incompatible shapes, so a
+            # global profile would break the detector — we copy provider_options
+            # and only amend the session whose model actually has a dynamic batch.
+            if _trt_on and _max_batch > 0 and "providers" in kwargs and "provider_options" in kwargs:
+                profile = _trt_batch_profile(model_path, _opt_batch, _max_batch)
+                providers = list(kwargs["providers"])
+                if profile and "TensorrtExecutionProvider" in providers:
+                    idx = providers.index("TensorrtExecutionProvider")
+                    opts = [dict(o) for o in kwargs["provider_options"]]
+                    opts[idx] = {**opts[idx], **profile}
+                    kwargs["provider_options"] = opts
             _original_init(self_sess, model_path, **kwargs)
 
         PickableInferenceSession.__init__ = _patched_init
@@ -119,6 +195,8 @@ class InsightFaceProvider(FaceProvider):
             "do_copy_in_default_stream": "1",
             "cudnn_conv_use_max_workspace": "1",
         }
+        if self._cuda_gpu_mem_limit_gb > 0:
+            cuda_ep_opts["gpu_mem_limit"] = str(int(self._cuda_gpu_mem_limit_gb * 1024**3))
 
         if self._use_gpu and self._use_tensorrt:
             import os
@@ -131,6 +209,8 @@ class InsightFaceProvider(FaceProvider):
                 "trt_engine_cache_path": self._trt_cache_path,
                 "trt_max_workspace_size": str(2 * 1024**3),
             }
+            if self._trt_cuda_graph:
+                trt_ep_opts["trt_cuda_graph_enable"] = "True"
             providers = ["TensorrtExecutionProvider", "CUDAExecutionProvider", "CPUExecutionProvider"]
             provider_options: list[dict[str, str]] = [trt_ep_opts, cuda_ep_opts, {}]
             log.info("tensorrt_enabled", trt_options=trt_ep_opts, cache_path=self._trt_cache_path)
@@ -203,13 +283,60 @@ class InsightFaceProvider(FaceProvider):
             y2 = max(0.0, min(y2, max_h))
         return BoundingBox(x=x1, y=y1, width=max(0.0, x2 - x1), height=max(0.0, y2 - y1))
 
+    def _recognize(self, rec_model: Any, crops: list[np.ndarray]) -> np.ndarray:
+        """Run recognition on face crops, chunked so the batch dimension never
+        exceeds the TRT optimization-profile maximum. Without chunking a request
+        with more faces than ``trt_max_batch`` would fall outside the profile and
+        either error or trigger a per-shape engine rebuild.
+        """
+        max_b = self._trt_max_batch
+        if max_b <= 0 or len(crops) <= max_b:
+            return rec_model.get_feat(crops)  # type: ignore[no-any-return]
+        feats = [rec_model.get_feat(crops[i : i + max_b]) for i in range(0, len(crops), max_b)]
+        return np.concatenate(feats, axis=0)
+
+    def _genderage_batch(
+        self, ga_model: Any, tasks: list[tuple[np.ndarray, np.ndarray]]
+    ) -> list[tuple[float | None, str | None]]:
+        """Batched genderage: replicates ``Attribute.get()`` preprocessing per face
+        but runs the ONNX session once per chunk instead of once per face. Tasks
+        are (working_image, raw_bbox) pairs; chunking follows the same TRT
+        optimization-profile bound as recognition.
+        """
+        from insightface.utils import face_align  # type: ignore[import-untyped]  # noqa: PLC0415
+
+        size = int(ga_model.input_size[0])
+        aimgs: list[np.ndarray] = []
+        for img, bbox in tasks:
+            w, h = bbox[2] - bbox[0], bbox[3] - bbox[1]
+            center = ((bbox[2] + bbox[0]) / 2, (bbox[3] + bbox[1]) / 2)
+            scale = size / (max(w, h) * 1.5)
+            aimg, _ = face_align.transform(img, center, size, scale, 0)
+            aimgs.append(aimg)
+
+        results: list[tuple[float | None, str | None]] = []
+        max_b = self._trt_max_batch if self._trt_max_batch > 0 else len(aimgs)
+        for i in range(0, len(aimgs), max_b):
+            blob = cv2.dnn.blobFromImages(
+                aimgs[i : i + max_b],
+                1.0 / ga_model.input_std,
+                tuple(ga_model.input_size),
+                (ga_model.input_mean,) * 3,
+                swapRB=True,
+            )
+            preds = ga_model.session.run(ga_model.output_names, {ga_model.input_name: blob})[0]
+            for pred in preds:
+                gender = "male" if int(np.argmax(pred[:2])) == 1 else "female"
+                results.append((float(int(np.round(pred[2] * 100))), gender))
+        return results
+
     def _align_and_embed(self, img: np.ndarray, kpss: np.ndarray) -> np.ndarray:
         rec_model = self._app.models["recognition"]
         crops = []
         for kps in kpss:
             aimg = _norm_crop(img, landmark=kps, image_size=rec_model.input_size[0])
             crops.append(aimg)
-        embeddings: np.ndarray = rec_model.get_feat(crops)
+        embeddings: np.ndarray = self._recognize(rec_model, crops)
         norms = np.linalg.norm(embeddings, axis=1, keepdims=True)
         norms = np.maximum(norms, 1e-10)
         normalized: np.ndarray = embeddings / norms
@@ -266,7 +393,7 @@ class InsightFaceProvider(FaceProvider):
             for i in range(bboxes.shape[0])
         ]
 
-    def analyze(self, image_bytes: bytes) -> list[DetectedFace]:
+    def analyze(self, image_bytes: bytes, with_attributes: bool = True) -> list[DetectedFace]:
         img = self._decode_image(image_bytes)
         if img is None:
             return []
@@ -276,37 +403,26 @@ class InsightFaceProvider(FaceProvider):
             return []
 
         embeddings = self._align_and_embed(working, kpss)
-        ga_model = self._app.models.get("genderage")
+
+        ga_model = self._app.models.get("genderage") if with_attributes else None
+        attrs: list[tuple[float | None, str | None]]
+        if ga_model is not None:
+            attrs = self._genderage_batch(ga_model, [(working, bboxes[i, :4]) for i in range(bboxes.shape[0])])
+        else:
+            attrs = [(None, None)] * bboxes.shape[0]
 
         orig_h, orig_w = img.shape[:2]
-        results: list[DetectedFace] = []
-        for i in range(bboxes.shape[0]):
-            age: float | None = None
-            gender: str | None = None
-
-            if ga_model is not None:
-                face_obj = _FaceProxy(bbox=bboxes[i, :4], kps=kpss[i] if kpss is not None else None)
-                ga_model.get(working, face_obj)
-                age = _to_float(face_obj.get("age"))
-                gender_val = face_obj.get("gender")
-                if gender_val is not None:
-                    try:
-                        gender = "male" if int(gender_val) == 1 else "female"  # type: ignore[call-overload]
-                    except (TypeError, ValueError):
-                        gender = str(gender_val)
-
-            results.append(
-                DetectedFace(
-                    bbox=self._make_bbox(bboxes[i, :4], dx, dy, orig_w, orig_h),
-                    det_score=float(bboxes[i, 4]),
-                    embedding=embeddings[i].astype(np.float32).tolist(),
-                    age=age,
-                    gender=gender,
-                    landmarks=self._kps_to_landmarks(kpss[i], dx, dy),
-                )
+        return [
+            DetectedFace(
+                bbox=self._make_bbox(bboxes[i, :4], dx, dy, orig_w, orig_h),
+                det_score=float(bboxes[i, 4]),
+                embedding=embeddings[i].astype(np.float32).tolist(),
+                age=attrs[i][0],
+                gender=attrs[i][1],
+                landmarks=self._kps_to_landmarks(kpss[i], dx, dy),
             )
-
-        return results
+            for i in range(bboxes.shape[0])
+        ]
 
     def embed_batch(self, images: list[bytes]) -> list[list[DetectedFace]]:
         rec_model = self._app.models["recognition"]
@@ -344,7 +460,7 @@ class InsightFaceProvider(FaceProvider):
                 all_crops = list(pool.map(lambda t: _norm_crop(t[0], t[1], image_size), align_tasks))
 
         if all_crops:
-            all_embeddings: np.ndarray = rec_model.get_feat(all_crops)
+            all_embeddings: np.ndarray = self._recognize(rec_model, all_crops)
             norms = np.linalg.norm(all_embeddings, axis=1, keepdims=True)
             norms = np.maximum(norms, 1e-10)
             all_embeddings = all_embeddings / norms
@@ -371,9 +487,9 @@ class InsightFaceProvider(FaceProvider):
 
         return results
 
-    def analyze_batch(self, images: list[bytes]) -> list[list[DetectedFace]]:
+    def analyze_batch(self, images: list[bytes], with_attributes: bool = True) -> list[list[DetectedFace]]:
         rec_model = self._app.models["recognition"]
-        ga_model = self._app.models.get("genderage")
+        ga_model = self._app.models.get("genderage") if with_attributes else None
         image_size = rec_model.input_size[0]
 
         # Stage 1: Decode images in parallel (cv2.imdecode releases the GIL)
@@ -394,6 +510,7 @@ class InsightFaceProvider(FaceProvider):
         all_crops: list[np.ndarray] = []
         crop_counts: list[int] = []
         align_tasks: list[tuple[np.ndarray, np.ndarray]] = []
+        ga_tasks: list[tuple[np.ndarray, np.ndarray]] = []
         for it in per_image:
             it_bboxes, it_kpss, it_working = it[0], it[1], it[2]
             if it_bboxes.shape[0] == 0 or it_kpss is None or it_working is None:
@@ -401,6 +518,8 @@ class InsightFaceProvider(FaceProvider):
                 continue
             for kps in it_kpss:
                 align_tasks.append((it_working, kps))
+            for i in range(it_bboxes.shape[0]):
+                ga_tasks.append((it_working, it_bboxes[i, :4]))
             crop_counts.append(it_bboxes.shape[0])
 
         if align_tasks:
@@ -408,41 +527,33 @@ class InsightFaceProvider(FaceProvider):
                 all_crops = list(pool.map(lambda t: _norm_crop(t[0], t[1], image_size), align_tasks))
 
         if all_crops:
-            all_embeddings: np.ndarray = rec_model.get_feat(all_crops)
+            all_embeddings: np.ndarray = self._recognize(rec_model, all_crops)
             norms = np.linalg.norm(all_embeddings, axis=1, keepdims=True)
             norms = np.maximum(norms, 1e-10)
             all_embeddings = all_embeddings / norms
         else:
             all_embeddings = np.zeros((0, 512), dtype=np.float32)
 
+        attrs: list[tuple[float | None, str | None]]
+        if ga_model is not None and ga_tasks:
+            attrs = self._genderage_batch(ga_model, ga_tasks)
+        else:
+            attrs = [(None, None)] * len(ga_tasks)
+
         results: list[list[DetectedFace]] = []
         emb_offset = 0
         for idx, it in enumerate(per_image):
-            it_bboxes, it_kpss, it_working, it_dx, it_dy, it_oh, it_ow = it
+            it_bboxes, it_kpss, _, it_dx, it_dy, it_oh, it_ow = it
             n = crop_counts[idx]
             faces: list[DetectedFace] = []
             for i in range(n):
-                age: float | None = None
-                gender: str | None = None
-
-                if ga_model is not None and it_working is not None and it_kpss is not None:
-                    face_obj = _FaceProxy(bbox=it_bboxes[i, :4], kps=it_kpss[i])
-                    ga_model.get(it_working, face_obj)
-                    age = _to_float(face_obj.get("age"))
-                    gender_val = face_obj.get("gender")
-                    if gender_val is not None:
-                        try:
-                            gender = "male" if int(gender_val) == 1 else "female"  # type: ignore[call-overload]
-                        except (TypeError, ValueError):
-                            gender = str(gender_val)
-
                 faces.append(
                     DetectedFace(
                         bbox=self._make_bbox(it_bboxes[i, :4], it_dx, it_dy, it_ow, it_oh),
                         det_score=float(it_bboxes[i, 4]),
                         embedding=all_embeddings[emb_offset + i].astype(np.float32).tolist(),
-                        age=age,
-                        gender=gender,
+                        age=attrs[emb_offset + i][0],
+                        gender=attrs[emb_offset + i][1],
                         landmarks=self._kps_to_landmarks(it_kpss[i] if it_kpss is not None else None, it_dx, it_dy),
                     )
                 )
@@ -454,19 +565,3 @@ class InsightFaceProvider(FaceProvider):
     @property
     def provider_name(self) -> str:
         return "insightface"
-
-
-class _FaceProxy:
-    def __init__(self, bbox: np.ndarray, kps: np.ndarray | None) -> None:
-        self.bbox = bbox
-        self.kps = kps
-        self._attrs: dict[str, Any] = {}
-
-    def __setitem__(self, key: str, value: object) -> None:
-        self._attrs[key] = value
-
-    def __getitem__(self, key: str) -> object:
-        return self._attrs[key]
-
-    def get(self, key: str, default: object = None) -> object:
-        return self._attrs.get(key, default)
