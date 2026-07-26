@@ -10,9 +10,11 @@ from src.config import settings
 from src.core.exceptions import AppError
 from src.dependencies import get_face_provider
 from src.schemas.faces import (
+    AnalyzeBatchRequest,
     AnalyzeBatchResponse,
     AnalyzeBatchResultItem,
     AnalyzeFaceSchema,
+    AnalyzeRequest,
     AnalyzeResponse,
     BatchRequest,
     BoundingBoxSchema,
@@ -32,7 +34,7 @@ from src.services.face_provider.base import DetectedFace, FaceProvider
 logger = structlog.get_logger()
 router = APIRouter(prefix="/faces", tags=["faces"])
 
-_inference_sem = asyncio.Semaphore(1)
+_inference_sem = asyncio.Semaphore(max(1, settings.face_inference_concurrency))
 
 ProviderDep = Annotated[FaceProvider, Depends(get_face_provider)]
 
@@ -101,10 +103,10 @@ async def embed(body: ImageRequest, provider: ProviderDep) -> EmbedResponse:
 
 
 @router.post("/analyze")
-async def analyze(body: ImageRequest, provider: ProviderDep) -> AnalyzeResponse:
+async def analyze(body: AnalyzeRequest, provider: ProviderDep) -> AnalyzeResponse:
     image_bytes = _decode_base64(body.image_b64)
     async with _inference_sem:
-        faces = await asyncio.to_thread(provider.analyze, image_bytes)
+        faces = await asyncio.to_thread(provider.analyze, image_bytes, body.attributes)
     return AnalyzeResponse(faces=[_to_analyze_schema(f) for f in faces], face_count=len(faces))
 
 
@@ -211,8 +213,11 @@ async def embed_batch(body: BatchRequest, provider: ProviderDep) -> EmbedBatchRe
 
 
 @router.post("/analyze/batch")
-async def analyze_batch(body: BatchRequest, provider: ProviderDep) -> AnalyzeBatchResponse:
-    results, total_faces = await _process_batch_optimized(body.images, provider.analyze_batch, _to_analyze_schema)
+async def analyze_batch(body: AnalyzeBatchRequest, provider: ProviderDep) -> AnalyzeBatchResponse:
+    def batch_method(images: list[bytes]) -> list[list[DetectedFace]]:
+        return provider.analyze_batch(images, body.attributes)
+
+    results, total_faces = await _process_batch_optimized(body.images, batch_method, _to_analyze_schema)
     return AnalyzeBatchResponse(
         results=[AnalyzeBatchResultItem(**r) for r in results],
         total_faces=total_faces,

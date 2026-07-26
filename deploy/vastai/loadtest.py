@@ -65,7 +65,10 @@ async def run(args: argparse.Namespace) -> None:
         print(f"Image not found: {img_path}", file=sys.stderr)
         sys.exit(2)
     img_bytes = img_path.read_bytes()
-    payload = json.dumps({"image_b64": base64.b64encode(img_bytes).decode()}).encode()
+    body: dict[str, object] = {"image_b64": base64.b64encode(img_bytes).decode()}
+    if args.no_attributes:
+        body["attributes"] = False
+    payload = json.dumps(body).encode()
     url = args.url.rstrip("/") + args.endpoint
 
     async with httpx.AsyncClient(timeout=600) as client:
@@ -117,6 +120,7 @@ def main() -> None:
     p.add_argument("--concurrency", type=int, default=16)
     p.add_argument("--duration", type=float, default=15)
     p.add_argument("--warmup", type=int, default=3)
+    p.add_argument("--no-attributes", action="store_true", help="Send attributes=false (skip genderage on /analyze)")
     args = p.parse_args()
     asyncio.run(run(args))
 

@@ -28,7 +28,9 @@ class FakeFaceProvider(FaceProvider):
     def embed(self, image_bytes: bytes) -> list[DetectedFace]:
         return [DetectedFace(bbox=self._FACE.bbox, det_score=self._FACE.det_score, embedding=self._FACE.embedding)]
 
-    def analyze(self, image_bytes: bytes) -> list[DetectedFace]:
+    def analyze(self, image_bytes: bytes, with_attributes: bool = True) -> list[DetectedFace]:
+        if not with_attributes:
+            return [DetectedFace(bbox=self._FACE.bbox, det_score=self._FACE.det_score, embedding=self._FACE.embedding)]
         return [self._FACE]
 
     @property

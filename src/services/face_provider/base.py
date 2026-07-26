@@ -35,7 +35,7 @@ class FaceProvider(ABC):
     def embed(self, image_bytes: bytes) -> list[DetectedFace]: ...
 
     @abstractmethod
-    def analyze(self, image_bytes: bytes) -> list[DetectedFace]: ...
+    def analyze(self, image_bytes: bytes, with_attributes: bool = True) -> list[DetectedFace]: ...
 
     def detect_batch(self, images: list[bytes]) -> list[list[DetectedFace]]:
         return [self.detect(img) for img in images]
@@ -43,8 +43,8 @@ class FaceProvider(ABC):
     def embed_batch(self, images: list[bytes]) -> list[list[DetectedFace]]:
         return [self.embed(img) for img in images]
 
-    def analyze_batch(self, images: list[bytes]) -> list[list[DetectedFace]]:
-        return [self.analyze(img) for img in images]
+    def analyze_batch(self, images: list[bytes], with_attributes: bool = True) -> list[list[DetectedFace]]:
+        return [self.analyze(img, with_attributes) for img in images]
 
     @property
     @abstractmethod
