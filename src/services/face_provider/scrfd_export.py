@@ -144,6 +144,12 @@ def _rewrite_graph(model: ModelProto, det_size: tuple[int, int]) -> bool:
         new_dims.add().dim_param = f"batch_anchors_{i}"
         new_dims.add().dim_value = chans
 
+    # Drop stale intermediate shape annotations: the stock export baked
+    # batch=1 into value_info, and the CUDA EP's memory-pattern planner trusts
+    # them — batch N then fails with "Shape mismatch attempting to re-use
+    # buffer {1,...}". ORT re-infers shapes at session load.
+    graph.ClearField("value_info")
+
     onnx.checker.check_model(model)
     return True
 
@@ -153,30 +159,34 @@ def convert_scrfd_to_dynamic_batch(model_path: str, det_size: tuple[int, int] = 
 
     Idempotent and safe to run concurrently from multiple processes sharing a
     model dir: writers produce identical bytes and swap via ``os.replace``.
-    If the file was already converted for a *different* ``det_size``, the
-    conversion is redone from the ``.bak`` copy of the original graph.
+    Whenever a ``.bak`` of the original graph exists, the conversion is redone
+    from it — so a model converted by an older/buggier version of this module
+    (or for a different ``det_size``) self-heals on the next startup; the
+    rewrite is skipped only when the resulting bytes already match the file.
     """
-    import onnx  # noqa: PLC0415
-
     backup_path = model_path + ".bak"
-    model = _load_model(model_path)
-    if _is_dynamic_batch(model, det_size):
-        return "already_dynamic"
+    have_backup = os.path.exists(backup_path)
+    model = _load_model(backup_path if have_backup else model_path)
 
     dims = _input_dims(model)
     if dims is not None and dims[0].dim_value == 0:
-        # Already dynamic but for another det_size — restart from the backup.
-        if not os.path.exists(backup_path):
-            return "unsupported"
-        model = _load_model(backup_path)
+        # No backup and the file itself is already dynamic: nothing to redo
+        # from, and re-running the rewrite needs the batch-1 original.
+        return "already_dynamic" if _is_dynamic_batch(model, det_size) else "unsupported"
 
     if not _rewrite_graph(model, det_size):
         return "unsupported"
 
-    if not os.path.exists(backup_path):
+    serialized = model.SerializeToString()
+    with open(model_path, "rb") as f:
+        if f.read() == serialized:
+            return "already_dynamic"
+
+    if not have_backup:
         shutil.copy2(model_path, backup_path)
     tmp_path = f"{model_path}.tmp.{os.getpid()}"
-    onnx.save(model, tmp_path)
+    with open(tmp_path, "wb") as f:
+        f.write(serialized)
     os.replace(tmp_path, model_path)
     return "converted"
 

@@ -395,17 +395,20 @@ class InsightFaceProvider(FaceProvider):
             k = (input_h // stride) * (input_w // stride) * det_model._num_anchors
             rows = slice(b * k, (b + 1) * k)
             scores = net_outs[idx][rows]
-            bbox_preds = net_outs[idx + fmc][rows] * stride
             anchor_centers = self._det_anchor_centers(stride)
             pos_inds = np.where(scores >= det_model.det_thresh)[0]
-            bboxes = distance2bbox(anchor_centers, bbox_preds)
+            # Unlike insightface's forward(), decode only the anchors above
+            # threshold — distance2bbox/kps are row-wise, so results are
+            # identical and the per-image cost drops from ~25k anchors to a
+            # handful.
+            bbox_preds = net_outs[idx + fmc][rows][pos_inds] * stride
+            bboxes = distance2bbox(anchor_centers[pos_inds], bbox_preds)
             scores_list.append(scores[pos_inds])
-            bboxes_list.append(bboxes[pos_inds])
+            bboxes_list.append(bboxes)
             if det_model.use_kps:
-                kps_preds = net_outs[idx + fmc * 2][rows] * stride
-                kpss = distance2kps(anchor_centers, kps_preds)
-                kpss = kpss.reshape((kpss.shape[0], -1, 2))
-                kpss_list.append(kpss[pos_inds])
+                kps_preds = net_outs[idx + fmc * 2][rows][pos_inds] * stride
+                kpss = distance2kps(anchor_centers[pos_inds], kps_preds)
+                kpss_list.append(kpss.reshape((kpss.shape[0], kpss.shape[1] // 2, 2)))
 
         scores_all = np.vstack(scores_list)
         order = scores_all.ravel().argsort()[::-1]
@@ -419,32 +422,58 @@ class InsightFaceProvider(FaceProvider):
             return det, kpss_all[order, :, :][keep, :, :]
         return det, None
 
-    def _detect_faces_batched(self, imgs: list[np.ndarray]) -> list[tuple[np.ndarray, np.ndarray | None]]:
-        """Detect faces in N images with one session.run per chunk instead of
-        one per image. Chunk size is bounded by the detector's TRT profile max
-        so every run stays inside the prebuilt engine."""
-        det_model = self._app.det_model
-        if len(imgs) > 1:
-            with ThreadPoolExecutor(max_workers=_BATCH_THREAD_WORKERS) as pool:
-                letterboxed = list(pool.map(self._letterbox, imgs))
-        else:
-            letterboxed = [self._letterbox(imgs[0])]
+    def _letterbox_blob(self, img: np.ndarray) -> tuple[np.ndarray, float]:
+        """Letterbox one image and convert it to a (1, 3, H, W) network blob.
 
+        Per-image ``blobFromImage`` (which releases the GIL, so it threads
+        well) is ~5x faster than one ``blobFromImages`` call over the whole
+        batch, and bit-identical to insightface's own preprocessing.
+        """
+        det_model = self._app.det_model
+        det_img, det_scale = self._letterbox(img)
         input_w, input_h = det_model.input_size
-        blob = cv2.dnn.blobFromImages(
-            [det_img for det_img, _ in letterboxed],
+        blob: np.ndarray = cv2.dnn.blobFromImage(
+            det_img,
             1.0 / det_model.input_std,
             (input_w, input_h),
             (det_model.input_mean, det_model.input_mean, det_model.input_mean),
             swapRB=True,
         )
-        max_b = self._det_trt_max_batch if self._det_trt_max_batch > 0 else len(imgs)
+        return blob, det_scale
+
+    def _detect_faces_batched(self, imgs: list[np.ndarray]) -> list[tuple[np.ndarray, np.ndarray | None]]:
+        """Detect faces in N images with one session.run per chunk instead of
+        one per image. Chunk size is bounded by the detector's TRT profile max
+        so every run stays inside the prebuilt engine.
+
+        Workers write each image's blob straight into its slice of one
+        preallocated (N, 3, H, W) array — a serial np.concatenate over the
+        batch costs more than the forward pass itself.
+        """
+        det_model = self._app.det_model
+        n = len(imgs)
+        input_w, input_h = det_model.input_size
+        blob = np.empty((n, 3, input_h, input_w), dtype=np.float32)
+        det_scales = [0.0] * n
+
+        def _fill(i: int) -> None:
+            img_blob, det_scale = self._letterbox_blob(imgs[i])
+            blob[i] = img_blob[0]
+            det_scales[i] = det_scale
+
+        if n > 1:
+            with ThreadPoolExecutor(max_workers=_BATCH_THREAD_WORKERS) as pool:
+                list(pool.map(_fill, range(n)))
+        else:
+            _fill(0)
+
+        max_b = self._det_trt_max_batch if self._det_trt_max_batch > 0 else n
         results: list[tuple[np.ndarray, np.ndarray | None]] = []
-        for start in range(0, len(imgs), max_b):
+        for start in range(0, n, max_b):
             chunk = blob[start : start + max_b]
             net_outs = det_model.session.run(det_model.output_names, {det_model.input_name: chunk})
             for b in range(chunk.shape[0]):
-                results.append(self._decode_det_output(net_outs, b, letterboxed[start + b][1]))
+                results.append(self._decode_det_output(net_outs, b, det_scales[start + b]))
         return results
 
     def _detect_batch(self, imgs: list[np.ndarray]) -> list[tuple[np.ndarray, np.ndarray | None]]:
