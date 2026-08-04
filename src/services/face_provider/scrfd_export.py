@@ -26,7 +26,6 @@ from __future__ import annotations
 
 import argparse
 import os
-import shutil
 from typing import TYPE_CHECKING, Any, Literal
 
 if TYPE_CHECKING:
@@ -207,20 +206,38 @@ def convert_scrfd_to_dynamic_batch(
     """Convert a SCRFD ONNX file to dynamic batch in place (atomic, with backup).
 
     Idempotent and safe to run concurrently from multiple processes sharing a
-    model dir: writers produce identical bytes and swap via ``os.replace``.
+    model dir: the source bytes are captured up front (never re-read from a
+    path a peer may have swapped), the backup is published create-only via an
+    atomic ``os.link``, and the model swap goes through tmp + ``os.replace``.
     Whenever a ``.bak`` of the original graph exists, the conversion is redone
     from it — so a model converted by an older/buggier version of this module
     (or for a different ``det_size``) self-heals on the next startup; the
     rewrite is skipped only when the resulting bytes already match the file.
+    A corrupt/truncated ``.bak`` degrades to converting from the live model
+    instead of poisoning every startup.
     """
+    import onnx  # noqa: PLC0415
+    from google.protobuf.message import DecodeError  # type: ignore[import-untyped]  # noqa: PLC0415
+
     backup_path = model_path + ".bak"
-    have_backup = os.path.exists(backup_path)
-    model = _load_model(backup_path if have_backup else model_path)
+    source_bytes: bytes | None = None
+    model = None
+    if os.path.exists(backup_path):
+        with open(backup_path, "rb") as f:
+            source_bytes = f.read()
+        try:
+            model = onnx.load_from_string(source_bytes)
+        except DecodeError:
+            source_bytes = None  # torn/corrupt backup — fall back to the live model
+    if model is None:
+        with open(model_path, "rb") as f:
+            source_bytes = f.read()
+        model = onnx.load_from_string(source_bytes)
 
     dims = _input_dims(model)
     if dims is not None and dims[0].dim_value == 0:
-        # No backup and the file itself is already dynamic: nothing to redo
-        # from, and re-running the rewrite needs the batch-1 original.
+        # The source graph is already dynamic (live model with no usable
+        # backup): nothing to redo from, the rewrite needs a batch-1 original.
         return "already_dynamic" if _is_dynamic_batch(model, det_size, uint8_input) else "unsupported"
 
     if not _rewrite_graph(model, det_size, uint8_input):
@@ -231,8 +248,21 @@ def convert_scrfd_to_dynamic_batch(
         if f.read() == serialized:
             return "already_dynamic"
 
-    if not have_backup:
-        shutil.copy2(model_path, backup_path)
+    if not os.path.exists(backup_path):
+        # Publish the pristine source bytes captured above — never a re-read of
+        # model_path, which a concurrently converting peer may have swapped
+        # already. os.link is atomic and create-only, so a peer's good backup
+        # can never be clobbered and readers never see a partial file.
+        assert source_bytes is not None
+        tmp_bak = f"{backup_path}.tmp.{os.getpid()}"
+        with open(tmp_bak, "wb") as f:
+            f.write(source_bytes)
+        try:
+            os.link(tmp_bak, backup_path)
+        except FileExistsError:
+            pass
+        finally:
+            os.unlink(tmp_bak)
     tmp_path = f"{model_path}.tmp.{os.getpid()}"
     with open(tmp_path, "wb") as f:
         f.write(serialized)

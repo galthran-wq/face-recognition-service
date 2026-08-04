@@ -153,3 +153,36 @@ class TestRealDetectorConversion:
 
         # Batched outputs must match the original graph run image-by-image.
         validate_dynamic_batch(model_path + ".bak", model_path, det_size=(640, 640), batch=2)
+
+
+class TestConcurrentSafety:
+    def test_backup_is_never_overwritten(self, tmp_path: Path) -> None:
+        # A good .bak must survive any later conversion (create-only publish).
+        model_path = str(tmp_path / "det_like.onnx")
+        _make_scrfd_like_model(model_path)
+        assert convert_scrfd_to_dynamic_batch(model_path, det_size=(8, 8)) == "converted"
+        bak_bytes = Path(model_path + ".bak").read_bytes()
+
+        # Force re-conversion with a different target — .bak must stay pristine.
+        assert convert_scrfd_to_dynamic_batch(model_path, det_size=(16, 16)) == "converted"
+        assert Path(model_path + ".bak").read_bytes() == bak_bytes
+
+    def test_corrupt_backup_falls_back_to_live_model(self, tmp_path: Path) -> None:
+        # A torn .bak (e.g. from a crashed peer) must not poison startup: the
+        # converter degrades to using the live batch-1 model as source.
+        model_path = str(tmp_path / "det_like.onnx")
+        _make_scrfd_like_model(model_path)
+        Path(model_path + ".bak").write_bytes(b"not-an-onnx-file")
+
+        assert convert_scrfd_to_dynamic_batch(model_path, det_size=(8, 8)) == "converted"
+        import onnxruntime as ort
+
+        sess = ort.InferenceSession(model_path, providers=["CPUExecutionProvider"])
+        assert sess.get_inputs()[0].shape[0] == "batch"
+
+    def test_no_temp_files_left_behind(self, tmp_path: Path) -> None:
+        model_path = str(tmp_path / "det_like.onnx")
+        _make_scrfd_like_model(model_path)
+        convert_scrfd_to_dynamic_batch(model_path, det_size=(8, 8))
+        leftovers = [p.name for p in tmp_path.iterdir() if ".tmp." in p.name]
+        assert leftovers == []

@@ -43,7 +43,7 @@ router = APIRouter(prefix="/faces", tags=["faces"])
 # request (decode, letterbox, crops, serialization) overlap another request's
 # GPU time instead of idling behind it. FACE_MAX_INFLIGHT=1 restores strictly
 # serial behavior.
-_inference_sem = asyncio.Semaphore(settings.face_max_inflight)
+_inference_sem = asyncio.Semaphore(max(1, settings.face_max_inflight))
 
 
 def _json_response(model: BaseModel) -> Response:

@@ -980,3 +980,80 @@ class TestConcurrentInference:
         assert len(detected) == 2
         assert detected[0][0].embedding is None
         assert detected[0][0].bbox.x == pytest.approx(10.0, abs=0.05)
+
+
+class TestDynamicBatchRollback:
+    @patch("insightface.app.FaceAnalysis", autospec=False)
+    def test_disabling_flag_restores_stock_graph_from_bak(self, mock_fa_cls: MagicMock, tmp_path: object) -> None:
+        import pathlib
+
+        mock_fa_cls.return_value = MagicMock()
+        pack_dir = pathlib.Path(str(tmp_path)) / "models" / "buffalo_l"
+        pack_dir.mkdir(parents=True)
+        det_path = pack_dir / "det_10g.onnx"
+        det_path.write_bytes(b"converted-graph")
+        (pack_dir / "det_10g.onnx.bak").write_bytes(b"stock-graph")
+
+        provider = InsightFaceProvider(use_gpu=False, model_dir=str(tmp_path), det_dynamic_batch=False)
+        provider.load_model()
+
+        assert det_path.read_bytes() == b"stock-graph"
+        assert not (pack_dir / "det_10g.onnx.bak").exists()
+
+    @patch("insightface.app.FaceAnalysis", autospec=False)
+    def test_disabling_flag_is_noop_without_bak(self, mock_fa_cls: MagicMock, tmp_path: object) -> None:
+        import pathlib
+
+        mock_fa_cls.return_value = MagicMock()
+        pack_dir = pathlib.Path(str(tmp_path)) / "models" / "buffalo_l"
+        pack_dir.mkdir(parents=True)
+        (pack_dir / "det_10g.onnx").write_bytes(b"stock-graph")
+
+        provider = InsightFaceProvider(use_gpu=False, model_dir=str(tmp_path), det_dynamic_batch=False)
+        provider.load_model()
+
+        assert (pack_dir / "det_10g.onnx").read_bytes() == b"stock-graph"
+
+
+class TestTrtProfileGating:
+    @staticmethod
+    def _make_model(path: str, spatial: tuple[int, int]) -> None:
+        import onnx
+        from onnx import TensorProto, helper
+
+        h, w = spatial
+        inp = helper.make_tensor_value_info("input.1", TensorProto.FLOAT, ["batch", 3, h, w])
+        out = helper.make_tensor_value_info("y", TensorProto.FLOAT, ["batch", 3, h, w])
+        relu = helper.make_node("Relu", ["input.1"], ["y"])
+        graph = helper.make_graph([relu], "m", [inp], [out])
+        onnx.save(helper.make_model(graph, opset_imports=[helper.make_opsetid("", 11)]), path)
+
+    def test_shared_knob_disabled_keeps_detector_profile(self, tmp_path: object) -> None:
+        from src.services.face_provider.insightface import _trt_batch_profile
+
+        det_path = f"{tmp_path}/det.onnx"
+        self._make_model(det_path, (640, 640))
+        profile = _trt_batch_profile(
+            det_path, opt_batch=16, max_batch=0, det_static_dims="3x640x640", det_opt_batch=8, det_max_batch=32
+        )
+        assert profile["trt_profile_max_shapes"] == "input.1:32x3x640x640"
+
+    def test_shared_knob_disabled_skips_recognition_profile(self, tmp_path: object) -> None:
+        from src.services.face_provider.insightface import _trt_batch_profile
+
+        rec_path = f"{tmp_path}/rec.onnx"
+        self._make_model(rec_path, (112, 112))
+        profile = _trt_batch_profile(
+            rec_path, opt_batch=16, max_batch=0, det_static_dims="3x640x640", det_opt_batch=8, det_max_batch=32
+        )
+        assert profile == {}
+
+    def test_opt_clamped_to_max(self, tmp_path: object) -> None:
+        from src.services.face_provider.insightface import _trt_batch_profile
+
+        det_path = f"{tmp_path}/det.onnx"
+        self._make_model(det_path, (640, 640))
+        profile = _trt_batch_profile(
+            det_path, opt_batch=16, max_batch=0, det_static_dims="3x640x640", det_opt_batch=8, det_max_batch=4
+        )
+        assert profile["trt_profile_opt_shapes"] == "input.1:4x3x640x640"

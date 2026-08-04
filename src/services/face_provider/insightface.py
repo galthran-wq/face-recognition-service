@@ -61,7 +61,9 @@ def _trt_batch_profile(
     The detector's inputs are ~30x larger than a recognition crop, so it gets
     its own batch bounds: an input whose static dims equal ``det_static_dims``
     (e.g. ``"3x640x640"``) uses ``det_opt_batch``/``det_max_batch`` instead of
-    the shared bounds; ``det_max_batch <= 0`` skips the profile for it.
+    the shared bounds. Each knob disables only its own profile when <= 0 —
+    ``max_batch <= 0`` skips recognition/genderage inputs, ``det_max_batch <=
+    0`` skips the detector input; the two are independent.
 
     With these options the TensorRT EP builds one engine spanning batch
     ``[1, max_batch]`` (cached to disk) instead of rebuilding a fresh engine the
@@ -86,11 +88,15 @@ def _trt_batch_profile(
         if not (batch_dynamic and rest_static):
             continue
         static = "x".join(str(d.dim_value) for d in dims[1:])
-        inp_opt, inp_max = opt_batch, max_batch
         if det_static_dims is not None and static == det_static_dims:
             if det_max_batch <= 0:
                 continue
             inp_opt, inp_max = det_opt_batch, det_max_batch
+        else:
+            if max_batch <= 0:
+                continue  # shared profile disabled — never emit a 0x... shape
+            inp_opt, inp_max = opt_batch, max_batch
+        inp_opt = max(1, min(inp_opt, inp_max))
         mins.append(f"{inp.name}:1x{static}")
         opts.append(f"{inp.name}:{inp_opt}x{static}")
         maxs.append(f"{inp.name}:{inp_max}x{static}")
@@ -224,20 +230,33 @@ class InsightFaceProvider(FaceProvider):
         # created, so one session.run covers a whole request batch (issue #126).
         # ensure_available downloads the model pack if missing — the same call
         # FaceAnalysis makes first thing in __init__, so no duplicate work.
-        if self._det_dynamic_batch:
-            import glob as _glob  # noqa: PLC0415
-            import os.path as _osp  # noqa: PLC0415
+        import glob as _glob  # noqa: PLC0415
+        import os as _os  # noqa: PLC0415
 
+        if self._det_dynamic_batch:
             from insightface.utils import ensure_available  # type: ignore[import-untyped]
 
             from src.services.face_provider.scrfd_export import convert_scrfd_to_dynamic_batch  # noqa: PLC0415
 
-            pack_dir = ensure_available("models", self._model_name, root=_osp.expanduser(self._model_dir))
-            for det_path in sorted(_glob.glob(_osp.join(pack_dir, "det_*.onnx"))):
+            pack_dir = ensure_available("models", self._model_name, root=_os.path.expanduser(self._model_dir))
+            for det_path in sorted(_glob.glob(_os.path.join(pack_dir, "det_*.onnx"))):
                 outcome = convert_scrfd_to_dynamic_batch(
                     det_path, det_size=self._det_size, uint8_input=self._det_uint8_input
                 )
                 log.info("scrfd_dynamic_batch_export", model=det_path, outcome=outcome, uint8=self._det_uint8_input)
+        else:
+            # True rollback: restore the stock batch-1 graphs from their .bak
+            # so the flag doesn't just skip the export while a previously
+            # converted file keeps running. Consuming the .bak is idempotent —
+            # re-enabling the flag recreates it from the restored original.
+            pack_dir = _os.path.join(_os.path.expanduser(self._model_dir), "models", self._model_name)
+            for bak_path in sorted(_glob.glob(_os.path.join(pack_dir, "det_*.onnx.bak"))):
+                det_path = bak_path.removesuffix(".bak")
+                try:
+                    _os.replace(bak_path, det_path)
+                except FileNotFoundError:
+                    continue  # a concurrently restoring peer won the race
+                log.info("scrfd_dynamic_batch_restore", model=det_path)
 
         # Monkey-patch to inject SessionOptions into all insightface ORT sessions.
         # FaceAnalysis only forwards `providers` and `provider_options` to sessions,
@@ -285,7 +304,8 @@ class InsightFaceProvider(FaceProvider):
             # recognizer share input name 'input.1' with incompatible shapes,
             # so a global profile would break — we copy provider_options and
             # only amend the session whose model actually has a dynamic batch.
-            if _trt_on and _max_batch > 0 and "providers" in kwargs and "provider_options" in kwargs:
+            profiles_wanted = _max_batch > 0 or _det_max_batch > 0
+            if _trt_on and profiles_wanted and "providers" in kwargs and "provider_options" in kwargs:
                 profile = _trt_batch_profile(
                     model_path,
                     _opt_batch,
