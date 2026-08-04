@@ -111,6 +111,18 @@ class TestInsightFaceProviderDetect:
         faces = provider.detect(_fake_image_bytes(), include_pose=True)
         assert faces[0].pose is None
 
+    def test_detect_batch_matches_single(self) -> None:
+        provider, _mock_app = _create_provider_with_mock()
+        img = _fake_image_bytes()
+
+        batched = provider.detect_batch([img, b"not-an-image", img])
+
+        assert len(batched) == 3
+        assert batched[1] == []
+        single = provider.detect(img)
+        assert batched[0] == single
+        assert batched[2] == single
+
 
 class TestInsightFaceProviderEmbed:
     def test_embed_returns_embedding_no_demographics(self) -> None:
