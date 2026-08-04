@@ -110,14 +110,15 @@ class TestUint8Input:
         inp = sess.get_inputs()[0]
         assert inp.name == "input_u8"
         assert inp.type == "tensor(uint8)"
+        assert inp.shape == ["batch", 8, 8, 3]  # NHWC: contiguous HWC canvas copy on the CPU side
 
         rng = np.random.default_rng(2)
-        u8 = rng.integers(0, 256, size=(2, 3, 8, 8), dtype=np.uint8)
+        u8 = rng.integers(0, 256, size=(2, 8, 8, 3), dtype=np.uint8)
         (from_u8,) = sess.run(None, {"input_u8": u8})
 
         orig = ort.InferenceSession(model_path + ".bak", providers=["CPUExecutionProvider"])
-        # blobFromImage equivalent: BGR->RGB swap + (x - 127.5) / 128
-        float_blob = (u8[:, ::-1, :, :].astype(np.float32) - 127.5) / 128.0
+        # blobFromImage equivalent: NHWC->NCHW + BGR->RGB swap + (x - 127.5) / 128
+        float_blob = (u8.transpose(0, 3, 1, 2)[:, ::-1, :, :].astype(np.float32) - 127.5) / 128.0
         expected = np.concatenate([orig.run(None, {"input.1": float_blob[b : b + 1]})[0] for b in range(2)])
         np.testing.assert_allclose(from_u8, expected, atol=1e-5)
 

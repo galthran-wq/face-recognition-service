@@ -154,6 +154,48 @@ def _norm_crop(img: np.ndarray, landmark: np.ndarray, image_size: int = 112) -> 
     return cv2.warpAffine(img, mat, (image_size, image_size), borderValue=0.0)
 
 
+def _estimate_norms_batch(lmks: np.ndarray, image_size: int = 112) -> np.ndarray:
+    """Vectorized _estimate_norm over N faces: one batched normal-equations
+    solve instead of one LAPACK lstsq call per face (~15x cheaper per request;
+    the per-call lstsq cost is dominated by setup, not arithmetic). The
+    systems are tiny, full-rank and well-conditioned, so the normal-equations
+    solution matches lstsq to ~1e-10.
+
+    lmks: (N, 5, 2) landmarks -> (N, 2, 3) affine matrices.
+    """
+    ratio = float(image_size) / 112.0
+    dst = _ARCFACE_DST * ratio
+    n = lmks.shape[0]
+    x = lmks[:, :, 0].astype(np.float64)
+    y = lmks[:, :, 1].astype(np.float64)
+    a = np.zeros((n, 10, 4), dtype=np.float64)
+    a[:, 0::2, 0] = x
+    a[:, 0::2, 1] = -y
+    a[:, 0::2, 2] = 1.0
+    a[:, 1::2, 0] = y
+    a[:, 1::2, 1] = x
+    a[:, 1::2, 3] = 1.0
+    b = np.empty(10, dtype=np.float64)
+    b[0::2] = dst[:, 0]
+    b[1::2] = dst[:, 1]
+    at = a.transpose(0, 2, 1)
+    try:
+        params = np.linalg.solve(at @ a, (at @ b)[..., None])[..., 0]
+    except np.linalg.LinAlgError:
+        # Degenerate landmarks (e.g. coincident points) make the normal
+        # equations singular where lstsq still yields a least-norm solution —
+        # fall back to the per-face path for the whole (rare) batch.
+        return np.stack([_estimate_norm(lmks[i], image_size) for i in range(n)])
+    mats = np.zeros((n, 2, 3), dtype=np.float64)
+    mats[:, 0, 0] = params[:, 0]
+    mats[:, 0, 1] = -params[:, 1]
+    mats[:, 0, 2] = params[:, 2]
+    mats[:, 1, 0] = params[:, 1]
+    mats[:, 1, 1] = params[:, 0]
+    mats[:, 1, 2] = params[:, 3]
+    return mats
+
+
 def _to_float(v: Any) -> float | None:
     try:
         return float(v)
@@ -225,6 +267,14 @@ class InsightFaceProvider(FaceProvider):
         from insightface.model_zoo.model_zoo import PickableInferenceSession  # type: ignore[import-untyped]
 
         log = structlog.get_logger()
+
+        # This service parallelizes cv2 work at image granularity (CvWorkPool)
+        # and at request granularity (FACE_MAX_INFLIGHT), so OpenCV's own
+        # nproc-wide parallel_for inside every resize/warpAffine/imdecode is
+        # pure thread contention — spawn-and-join of a 56-task barrier per
+        # 640px resize on a 56-core host, multiplied by pool workers and
+        # instances. Pin it to 1; our pools own the parallelism.
+        cv2.setNumThreads(1)
 
         # Re-export the detector with a dynamic batch dim before any session is
         # created, so one session.run covers a whole request batch (issue #126).
@@ -402,7 +452,7 @@ class InsightFaceProvider(FaceProvider):
     def _letterbox(self, img: np.ndarray) -> tuple[np.ndarray, float]:
         """Aspect-preserving resize onto a det_size canvas (top-left anchored),
         exactly mirroring insightface's SCRFD.detect preprocessing."""
-        input_w, input_h = self._app.det_model.input_size
+        input_w, input_h = self._det_input_size()
         im_ratio = float(img.shape[0]) / img.shape[1]
         model_ratio = float(input_h) / input_w
         if im_ratio > model_ratio:
@@ -424,7 +474,7 @@ class InsightFaceProvider(FaceProvider):
         if cached is not None:
             return cached
         det_model = self._app.det_model
-        input_w, input_h = det_model.input_size
+        input_w, input_h = self._det_input_size()
         height, width = input_h // stride, input_w // stride
         grid = np.mgrid[:height, :width]
         centers = np.stack((grid[1], grid[0]), axis=-1).astype(np.float32)
@@ -449,7 +499,7 @@ class InsightFaceProvider(FaceProvider):
         )
 
         det_model = self._app.det_model
-        input_w, input_h = det_model.input_size
+        input_w, input_h = self._det_input_size()
         fmc = det_model.fmc
         scores_list: list[np.ndarray] = []
         bboxes_list: list[np.ndarray] = []
@@ -485,6 +535,17 @@ class InsightFaceProvider(FaceProvider):
             return det, kpss_all[order, :, :][keep, :, :]
         return det, None
 
+    def _det_input_size(self) -> tuple[int, int]:
+        """(W, H) of the detector graph input, layout-aware: converted graphs
+        are NCHW float or NHWC uint8. Falls back to insightface's parsed value
+        for stock (non-batch-capable) graphs, which never reach this path."""
+        shape = self._app.det_model.session.get_inputs()[0].shape
+        if isinstance(shape, (list, tuple)) and len(shape) == 4 and isinstance(shape[2], int):
+            if shape[3] == 3:  # NHWC
+                return (shape[2], shape[1])
+            return (shape[3], shape[2])  # NCHW
+        return self._app.det_model.input_size  # type: ignore[no-any-return]
+
     def _det_input_is_uint8(self) -> bool:
         """True if the detector graph carries its own normalization and takes
         raw uint8 BGR NCHW canvases (see scrfd_export uint8_input)."""
@@ -499,7 +560,7 @@ class InsightFaceProvider(FaceProvider):
         """
         det_model = self._app.det_model
         det_img, det_scale = self._letterbox(img)
-        input_w, input_h = det_model.input_size
+        input_w, input_h = self._det_input_size()
         blob: np.ndarray = cv2.dnn.blobFromImage(
             det_img,
             1.0 / det_model.input_std,
@@ -520,15 +581,26 @@ class InsightFaceProvider(FaceProvider):
         """
         det_model = self._app.det_model
         n = len(imgs)
-        input_w, input_h = det_model.input_size
+        input_w, input_h = self._det_input_size()
         uint8_input = self._det_input_is_uint8()
-        blob = np.empty((n, 3, input_h, input_w), dtype=np.uint8 if uint8_input else np.float32)
+        in_shape = det_model.session.get_inputs()[0].shape
+        nhwc = uint8_input and isinstance(in_shape, (list, tuple)) and in_shape[3] == 3
+        if nhwc:
+            blob = np.empty((n, input_h, input_w, 3), dtype=np.uint8)
+        elif uint8_input:
+            blob = np.empty((n, 3, input_h, input_w), dtype=np.uint8)
+        else:
+            blob = np.empty((n, 3, input_h, input_w), dtype=np.float32)
         det_scales = [0.0] * n
 
         def _fill(i: int) -> None:
-            if uint8_input:
-                # Normalization lives in the graph — ship the raw letterboxed
-                # canvas (uint8 CHW, 4x less PCIe than a float blob).
+            if nhwc:
+                # Normalization AND the NCHW transpose live in the graph — the
+                # letterboxed BGR canvas is copied contiguously as-is (a CHW
+                # transpose here is a strided 3-plane gather, ~7x slower).
+                det_img, det_scale = self._letterbox(imgs[i])
+                blob[i] = det_img
+            elif uint8_input:
                 det_img, det_scale = self._letterbox(imgs[i])
                 blob[i] = det_img.transpose(2, 0, 1)
             else:
@@ -717,12 +789,21 @@ class InsightFaceProvider(FaceProvider):
             results.append((age, gender))
         return results
 
+    def _aligned_crops(self, tasks: list[tuple[np.ndarray, np.ndarray]], image_size: int) -> list[np.ndarray]:
+        """Warp all (working_img, landmarks) face crops of a request: the
+        affine matrices come from one vectorized solve, the warps run on the
+        shared pool (cv2.warpAffine releases the GIL)."""
+        if not tasks:
+            return []
+        mats = _estimate_norms_batch(np.stack([kps for _, kps in tasks]), image_size)
+        return self._cv_pool.map(
+            lambda i: cv2.warpAffine(tasks[i][0], mats[i], (image_size, image_size), borderValue=0.0),
+            range(len(tasks)),
+        )
+
     def _align_and_embed(self, img: np.ndarray, kpss: np.ndarray) -> np.ndarray:
         rec_model = self._app.models["recognition"]
-        crops = []
-        for kps in kpss:
-            aimg = _norm_crop(img, landmark=kps, image_size=rec_model.input_size[0])
-            crops.append(aimg)
+        crops = self._aligned_crops([(img, kps) for kps in kpss], rec_model.input_size[0])
         embeddings: np.ndarray = self._recognize(rec_model, crops)
         norms = np.linalg.norm(embeddings, axis=1, keepdims=True)
         norms = np.maximum(norms, 1e-10)
@@ -884,7 +965,7 @@ class InsightFaceProvider(FaceProvider):
             crop_counts.append(it_bboxes.shape[0])
 
         if align_tasks:
-            all_crops = self._cv_pool.map(lambda t: _norm_crop(t[0], t[1], image_size), align_tasks)
+            all_crops = self._aligned_crops(align_tasks, image_size)
 
         if all_crops:
             all_embeddings: np.ndarray = self._recognize(rec_model, all_crops)
@@ -940,7 +1021,7 @@ class InsightFaceProvider(FaceProvider):
             crop_counts.append(it_bboxes.shape[0])
 
         if align_tasks:
-            all_crops = self._cv_pool.map(lambda t: _norm_crop(t[0], t[1], image_size), align_tasks)
+            all_crops = self._aligned_crops(align_tasks, image_size)
 
         if all_crops:
             all_embeddings: np.ndarray = self._recognize(rec_model, all_crops)

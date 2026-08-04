@@ -578,7 +578,7 @@ class _FakeBatchedSession:
 
     def run(self, output_names: list[str], feed: dict[str, np.ndarray]) -> list[np.ndarray]:
         blob = next(iter(feed.values()))
-        assert blob.shape[1:] == (3, _DET_INPUT, _DET_INPUT)
+        assert blob.shape[1:] in ((3, _DET_INPUT, _DET_INPUT), (_DET_INPUT, _DET_INPUT, 3))
         self.run_batch_sizes.append(blob.shape[0])
         response = self._responses.pop(0)
         assert response[0].shape[0] == blob.shape[0] * _stride_anchor_count(8), (
@@ -746,7 +746,7 @@ class TestUint8DetectorInput:
         responses = [_craft_scrfd_net_outs([[((64.0, 128.0, 384.0, 448.0), 0.9)]])]
         provider, mock_app = _create_batched_provider(responses)
         session = mock_app.det_model.session
-        u8_arg_cls = type("N", (), {"name": "input_u8", "shape": ["batch", 3, _DET_INPUT, _DET_INPUT]})
+        u8_arg_cls = type("N", (), {"name": "input_u8", "shape": ["batch", _DET_INPUT, _DET_INPUT, 3]})
         u8_arg = u8_arg_cls()
         u8_arg.type = "tensor(uint8)"
         session.get_inputs = lambda: [u8_arg]
@@ -758,7 +758,7 @@ class TestUint8DetectorInput:
 
         assert len(fed) == 1
         assert fed[0].dtype == np.uint8
-        assert fed[0].shape == (1, 3, _DET_INPUT, _DET_INPUT)
+        assert fed[0].shape == (1, _DET_INPUT, _DET_INPUT, 3)  # NHWC
         assert len(faces) == 1
         assert faces[0].bbox.x == pytest.approx(10.0, abs=0.05)
 
@@ -1057,3 +1057,17 @@ class TestTrtProfileGating:
             det_path, opt_batch=16, max_batch=0, det_static_dims="3x640x640", det_opt_batch=8, det_max_batch=4
         )
         assert profile["trt_profile_opt_shapes"] == "input.1:4x3x640x640"
+
+
+class TestVectorizedNormEstimation:
+    def test_batch_matches_per_face_lstsq(self) -> None:
+        from src.services.face_provider.insightface import _estimate_norm, _estimate_norms_batch
+
+        rng = np.random.default_rng(5)
+        lmks = rng.uniform(20, 600, size=(40, 5, 2)).astype(np.float32)
+
+        batched = _estimate_norms_batch(lmks, 112)
+
+        for i in range(lmks.shape[0]):
+            single = _estimate_norm(lmks[i], 112)
+            np.testing.assert_allclose(batched[i], single, atol=1e-8)

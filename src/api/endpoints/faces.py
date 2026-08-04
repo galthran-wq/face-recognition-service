@@ -1,9 +1,9 @@
 import asyncio
-import base64
 import functools
 from collections.abc import Callable
 from typing import Annotated
 
+import pybase64
 import structlog
 from fastapi import APIRouter, Depends
 from fastapi.responses import Response
@@ -59,8 +59,11 @@ ProviderDep = Annotated[FaceProvider, Depends(get_face_provider)]
 
 
 def _decode_base64(image_b64: str) -> bytes:
+    # pybase64 = SIMD (AVX2) decoder, ~5-8x the stdlib's scalar loop and it
+    # releases the GIL on large inputs; validate=True is its fastest path and
+    # keeps the same reject-invalid-input contract as base64.b64decode.
     try:
-        return base64.b64decode(image_b64, validate=True)
+        return pybase64.b64decode(image_b64, validate=True)
     except Exception:
         raise AppError(400, "Invalid base64-encoded image")  # noqa: B904
 

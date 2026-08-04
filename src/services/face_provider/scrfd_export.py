@@ -55,30 +55,39 @@ def _input_dims(model: ModelProto) -> list[Any] | None:
 
 def _is_dynamic_batch(model: ModelProto, det_size: tuple[int, int], uint8_input: bool) -> bool:
     """True if the graph already matches the conversion target: dynamic batch,
-    spatial dims == det_size, and the requested input dtype."""
+    spatial dims == det_size, and the requested input dtype/layout (float NCHW
+    or uint8 NHWC)."""
     from onnx import TensorProto  # noqa: PLC0415
 
     dims = _input_dims(model)
     if dims is None:
         return False
-    want_elem = TensorProto.UINT8 if uint8_input else TensorProto.FLOAT
-    batch, channels, height, width = dims
+    elem = model.graph.input[0].type.tensor_type.elem_type
+    if uint8_input:
+        batch, height, width, channels = dims
+        want_elem = int(TensorProto.UINT8)
+    else:
+        batch, channels, height, width = dims
+        want_elem = int(TensorProto.FLOAT)
     return bool(
         batch.dim_value == 0
         and channels.dim_value == 3
         and height.dim_value == det_size[1]
         and width.dim_value == det_size[0]
-        and model.graph.input[0].type.tensor_type.elem_type == want_elem
+        and elem == want_elem
     )
 
 
 def _prepend_uint8_preprocessing(model: ModelProto) -> None:
     """Move normalization into the graph: replace the float NCHW input with a
-    uint8 BGR NCHW input followed by Cast -> BGR-to-RGB Gather -> Sub(mean) ->
-    Mul(1/std), reproducing cv2.dnn.blobFromImage(..., swapRB=True) exactly.
+    uint8 BGR NHWC input followed by Cast -> Transpose(NHWC->NCHW) ->
+    BGR-to-RGB Gather -> Sub(mean) -> Mul(1/std), reproducing
+    cv2.dnn.blobFromImage(..., swapRB=True) exactly.
 
-    The caller then feeds letterboxed uint8 canvases directly: no CPU float
-    conversion, and 4x less data over PCIe per image.
+    NHWC is deliberate: the caller can copy a letterboxed HWC canvas into the
+    batch blob contiguously (a CPU-side CHW transpose is a strided 3-plane
+    gather, ~7x slower), and the data crosses PCIe as uint8 — 4x less than a
+    float blob.
     """
     import numpy as np  # noqa: PLC0415
     from onnx import TensorProto, helper, numpy_helper  # noqa: PLC0415
@@ -88,7 +97,10 @@ def _prepend_uint8_preprocessing(model: ModelProto) -> None:
     old_name = old_input.name
 
     new_input = helper.make_tensor_value_info("input_u8", TensorProto.UINT8, None)
-    new_input.type.tensor_type.shape.CopyFrom(old_input.type.tensor_type.shape)
+    old_dims = old_input.type.tensor_type.shape.dim  # (batch, 3, H, W)
+    new_shape = new_input.type.tensor_type.shape
+    for src in (old_dims[0], old_dims[2], old_dims[3], old_dims[1]):
+        new_shape.dim.add().CopyFrom(src)
 
     graph.initializer.extend(
         [
@@ -99,7 +111,8 @@ def _prepend_uint8_preprocessing(model: ModelProto) -> None:
     )
     pre_nodes = [
         helper.make_node("Cast", ["input_u8"], ["det_pre_f32"], name="det_pre_cast", to=TensorProto.FLOAT),
-        helper.make_node("Gather", ["det_pre_f32", "det_pre_bgr2rgb"], ["det_pre_rgb"], name="det_pre_swap", axis=1),
+        helper.make_node("Transpose", ["det_pre_f32"], ["det_pre_nchw"], name="det_pre_nchw_t", perm=[0, 3, 1, 2]),
+        helper.make_node("Gather", ["det_pre_nchw", "det_pre_bgr2rgb"], ["det_pre_rgb"], name="det_pre_swap", axis=1),
         helper.make_node("Sub", ["det_pre_rgb", "det_pre_mean"], ["det_pre_centered"], name="det_pre_sub"),
         # The old graph input name becomes an internal tensor feeding the
         # original first layer untouched.
@@ -298,8 +311,10 @@ def validate_dynamic_batch(
 
     conv_blob: Any
     if conv_input_cfg.type == "tensor(uint8)":
-        conv_blob = rng.integers(0, 256, size=(batch, 3, det_size[1], det_size[0]), dtype=np.uint8)
-        blob = (conv_blob[:, ::-1, :, :].astype(np.float32) - 127.5) / 128.0
+        # NHWC BGR uint8 in; the float reference gets the equivalent
+        # normalized RGB NCHW blob.
+        conv_blob = rng.integers(0, 256, size=(batch, det_size[1], det_size[0], 3), dtype=np.uint8)
+        blob = (conv_blob.transpose(0, 3, 1, 2)[:, ::-1, :, :].astype(np.float32) - 127.5) / 128.0
     else:
         blob = rng.standard_normal((batch, 3, det_size[1], det_size[0]), dtype=np.float32)
         conv_blob = blob
