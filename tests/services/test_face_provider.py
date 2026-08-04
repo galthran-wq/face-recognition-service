@@ -185,10 +185,24 @@ class TestInsightFaceProviderLoadModel:
         provider.load_model()
 
         mock_fa_cls.assert_called_once_with(
-            name="buffalo_l", root="~/.insightface", providers=["CPUExecutionProvider"], provider_options=[{}]
+            name="buffalo_l",
+            root="~/.insightface",
+            providers=["CPUExecutionProvider"],
+            provider_options=[{}],
+            allowed_modules=["detection", "recognition", "genderage"],
         )
         mock_instance.prepare.assert_called_once_with(ctx_id=0, det_size=(320, 320))
         assert provider.is_loaded is True
+
+    @patch("insightface.app.FaceAnalysis", autospec=False)
+    def test_load_model_pose_enabled_loads_all_modules(self, mock_fa_cls: MagicMock) -> None:
+        mock_instance = MagicMock()
+        mock_fa_cls.return_value = mock_instance
+
+        provider = InsightFaceProvider(use_gpu=False, enable_pose=True)
+        provider.load_model()
+
+        assert "allowed_modules" not in mock_fa_cls.call_args.kwargs
 
     @patch("insightface.app.FaceAnalysis", autospec=False)
     def test_load_model_gpu(self, mock_fa_cls: MagicMock) -> None:
@@ -212,6 +226,7 @@ class TestInsightFaceProviderLoadModel:
                 },
                 {},
             ],
+            allowed_modules=["detection", "recognition", "genderage"],
         )
         mock_instance.prepare.assert_called_once_with(ctx_id=1, det_size=(640, 640))
 

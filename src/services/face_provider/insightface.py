@@ -131,6 +131,7 @@ class InsightFaceProvider(FaceProvider):
         trt_opt_batch: int = 16,
         pad_fallback_border_px: int = 100,
         pad_fallback_fill: int = 128,
+        enable_pose: bool = False,
     ) -> None:
         self._use_gpu = use_gpu
         self._ctx_id = ctx_id
@@ -143,6 +144,7 @@ class InsightFaceProvider(FaceProvider):
         self._trt_opt_batch = trt_opt_batch
         self._pad_border_px = pad_fallback_border_px
         self._pad_fill = pad_fallback_fill
+        self._enable_pose = enable_pose
         self._app: Any = None
 
     def load_model(self) -> None:
@@ -235,6 +237,8 @@ class InsightFaceProvider(FaceProvider):
             provider_options = [{}]
 
         fa_kwargs: dict[str, Any] = {"providers": providers, "provider_options": provider_options}
+        if not self._enable_pose:
+            fa_kwargs["allowed_modules"] = ["detection", "recognition", "genderage"]
 
         self._app = FaceAnalysis(name=self._model_name, root=self._model_dir, **fa_kwargs)
         self._app.prepare(ctx_id=self._ctx_id, det_size=self._det_size)

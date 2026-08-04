@@ -25,6 +25,7 @@ def create_provider(settings: Settings) -> FaceProvider:
             trt_opt_batch=settings.face_trt_opt_batch,
             pad_fallback_border_px=settings.face_pad_fallback_border_px,
             pad_fallback_fill=settings.face_pad_fallback_fill,
+            enable_pose=settings.face_enable_pose,
         )
 
     msg = f"Unknown face provider: {name!r}"
