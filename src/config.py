@@ -33,6 +33,31 @@ class Settings(BaseSettings):
     # chunked to max_batch. Set max_batch<=0 to disable profiles (legacy behavior).
     face_trt_max_batch: int = 256
     face_trt_opt_batch: int = 16
+    # Dynamic-batch SCRFD detection (issue #126). On startup the detector graph
+    # is re-exported in place with a dynamic batch dim and static det_size
+    # spatial dims (original kept as .onnx.bak), so a request batch of N images
+    # costs one session.run instead of N. Detector inputs are ~30x larger than
+    # recognition crops, so it gets its own TRT profile bounds; batched
+    # detection is also chunked to face_det_trt_max_batch per run.
+    face_det_dynamic_batch: bool = True
+    # Bake normalization into the detector graph (uint8 BGR input): no CPU
+    # float conversion and 4x less PCIe traffic per image. Requires
+    # face_det_dynamic_batch; flip off to fall back to the float-input graph
+    # (self-heals from the .onnx.bak on restart).
+    face_det_uint8_input: bool = True
+    face_det_trt_max_batch: int = 32
+    face_det_trt_opt_batch: int = 8
+    # Size of the provider's persistent CPU worker pool (JPEG decode, letterbox,
+    # crops). Decode scales near-linearly to ~16 threads on an idle host; keep
+    # instances_per_host * face_thread_workers within the core budget.
+    face_thread_workers: int = 8
+    # Requests allowed inside the provider concurrently. GPU passes stay
+    # serialized by an internal lock, so >1 lets request N+1's CPU stages
+    # (decode, letterbox, crops, serialization) overlap request N's GPU time —
+    # the GPU is busy only ~25-30% of a request otherwise. 1 restores strictly
+    # serial behavior. The CvWorkPool is shared, so inflight does not multiply
+    # the thread budget.
+    face_max_inflight: int = 3
     # Pad-to-square fallback for frame-filling faces missed by RetinaFace anchors.
     face_pad_fallback_border_px: int = 100
     face_pad_fallback_fill: int = 128

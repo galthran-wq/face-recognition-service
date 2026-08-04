@@ -1,23 +1,69 @@
 from __future__ import annotations
 
+import threading
 from concurrent.futures import ThreadPoolExecutor
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from collections.abc import Callable, Sequence
 
 import cv2
 import numpy as np
 
 from src.services.face_provider.base import BoundingBox, DetectedFace, FaceProvider, HeadPose
 
-_BATCH_THREAD_WORKERS = 4
+
+class CvWorkPool:
+    """Persistent thread pool for CPU-bound cv2/numpy work.
+
+    JPEG decode, letterbox resize, warpAffine crops and blob fills all release
+    the GIL, so they thread well — but a fresh ThreadPoolExecutor per request
+    pays thread spawn/teardown on every call. This keeps one warm pool for the
+    provider's lifetime (threads are created lazily by the executor, so an
+    unused pool costs nothing). Sized via FACE_THREAD_WORKERS.
+    """
+
+    def __init__(self, workers: int) -> None:
+        self._workers = max(1, workers)
+        self._pool = ThreadPoolExecutor(max_workers=self._workers, thread_name_prefix="face-cv")
+
+    def decode_batch(
+        self, decode: Callable[[bytes], np.ndarray | None], images: list[bytes]
+    ) -> list[np.ndarray | None]:
+        """Decode a batch of encoded images (JPEG/PNG) in parallel."""
+        return self.map(decode, images)
+
+    def map(self, fn: Callable[[Any], Any], items: Sequence[Any]) -> list[Any]:
+        if len(items) <= 1:
+            return [fn(item) for item in items]
+        return list(self._pool.map(fn, items))
 
 
-def _trt_batch_profile(model_path: str, opt_batch: int, max_batch: int) -> dict[str, str]:
+# Per-image detection state: (bboxes, kpss, working_img, dx, dy, orig_h, orig_w).
+_DetResult = tuple[np.ndarray, "np.ndarray | None", "np.ndarray | None", int, int, int, int]
+
+
+def _trt_batch_profile(
+    model_path: str,
+    opt_batch: int,
+    max_batch: int,
+    det_static_dims: str | None = None,
+    det_opt_batch: int = 0,
+    det_max_batch: int = 0,
+) -> dict[str, str]:
     """Build TRT optimization-profile options for a dynamic-batch model.
 
     Matches models whose first input dim is a dynamic batch and whose remaining
-    dims are static (recognition `Nx3x112x112`, genderage `Nx3x96x96`). Returns
-    ``{}`` for anything else — notably the detector, whose batch is fixed at 1
-    and whose spatial dims are dynamic — so their TRT behavior is unchanged.
+    dims are static (recognition `Nx3x112x112`, genderage `Nx3x96x96`, and the
+    re-exported detector `Nx3x640x640` — see ``scrfd_export``). Returns ``{}``
+    for anything else.
+
+    The detector's inputs are ~30x larger than a recognition crop, so it gets
+    its own batch bounds: an input whose static dims equal ``det_static_dims``
+    (e.g. ``"3x640x640"``) uses ``det_opt_batch``/``det_max_batch`` instead of
+    the shared bounds. Each knob disables only its own profile when <= 0 —
+    ``max_batch <= 0`` skips recognition/genderage inputs, ``det_max_batch <=
+    0`` skips the detector input; the two are independent.
 
     With these options the TensorRT EP builds one engine spanning batch
     ``[1, max_batch]`` (cached to disk) instead of rebuilding a fresh engine the
@@ -42,9 +88,18 @@ def _trt_batch_profile(model_path: str, opt_batch: int, max_batch: int) -> dict[
         if not (batch_dynamic and rest_static):
             continue
         static = "x".join(str(d.dim_value) for d in dims[1:])
+        if det_static_dims is not None and static == det_static_dims:
+            if det_max_batch <= 0:
+                continue
+            inp_opt, inp_max = det_opt_batch, det_max_batch
+        else:
+            if max_batch <= 0:
+                continue  # shared profile disabled — never emit a 0x... shape
+            inp_opt, inp_max = opt_batch, max_batch
+        inp_opt = max(1, min(inp_opt, inp_max))
         mins.append(f"{inp.name}:1x{static}")
-        opts.append(f"{inp.name}:{opt_batch}x{static}")
-        maxs.append(f"{inp.name}:{max_batch}x{static}")
+        opts.append(f"{inp.name}:{inp_opt}x{static}")
+        maxs.append(f"{inp.name}:{inp_max}x{static}")
     if not mins:
         return {}
     return {
@@ -99,6 +154,48 @@ def _norm_crop(img: np.ndarray, landmark: np.ndarray, image_size: int = 112) -> 
     return cv2.warpAffine(img, mat, (image_size, image_size), borderValue=0.0)
 
 
+def _estimate_norms_batch(lmks: np.ndarray, image_size: int = 112) -> np.ndarray:
+    """Vectorized _estimate_norm over N faces: one batched normal-equations
+    solve instead of one LAPACK lstsq call per face (~15x cheaper per request;
+    the per-call lstsq cost is dominated by setup, not arithmetic). The
+    systems are tiny, full-rank and well-conditioned, so the normal-equations
+    solution matches lstsq to ~1e-10.
+
+    lmks: (N, 5, 2) landmarks -> (N, 2, 3) affine matrices.
+    """
+    ratio = float(image_size) / 112.0
+    dst = _ARCFACE_DST * ratio
+    n = lmks.shape[0]
+    x = lmks[:, :, 0].astype(np.float64)
+    y = lmks[:, :, 1].astype(np.float64)
+    a = np.zeros((n, 10, 4), dtype=np.float64)
+    a[:, 0::2, 0] = x
+    a[:, 0::2, 1] = -y
+    a[:, 0::2, 2] = 1.0
+    a[:, 1::2, 0] = y
+    a[:, 1::2, 1] = x
+    a[:, 1::2, 3] = 1.0
+    b = np.empty(10, dtype=np.float64)
+    b[0::2] = dst[:, 0]
+    b[1::2] = dst[:, 1]
+    at = a.transpose(0, 2, 1)
+    try:
+        params = np.linalg.solve(at @ a, (at @ b)[..., None])[..., 0]
+    except np.linalg.LinAlgError:
+        # Degenerate landmarks (e.g. coincident points) make the normal
+        # equations singular where lstsq still yields a least-norm solution —
+        # fall back to the per-face path for the whole (rare) batch.
+        return np.stack([_estimate_norm(lmks[i], image_size) for i in range(n)])
+    mats = np.zeros((n, 2, 3), dtype=np.float64)
+    mats[:, 0, 0] = params[:, 0]
+    mats[:, 0, 1] = -params[:, 1]
+    mats[:, 0, 2] = params[:, 2]
+    mats[:, 1, 0] = params[:, 1]
+    mats[:, 1, 1] = params[:, 0]
+    mats[:, 1, 2] = params[:, 3]
+    return mats
+
+
 def _to_float(v: Any) -> float | None:
     try:
         return float(v)
@@ -129,6 +226,11 @@ class InsightFaceProvider(FaceProvider):
         trt_cache_path: str = "/models/trt_cache",
         trt_max_batch: int = 256,
         trt_opt_batch: int = 16,
+        det_dynamic_batch: bool = True,
+        det_uint8_input: bool = True,
+        det_trt_max_batch: int = 32,
+        det_trt_opt_batch: int = 8,
+        thread_workers: int = 8,
         pad_fallback_border_px: int = 100,
         pad_fallback_fill: int = 128,
     ) -> None:
@@ -141,8 +243,21 @@ class InsightFaceProvider(FaceProvider):
         self._trt_cache_path = trt_cache_path
         self._trt_max_batch = trt_max_batch
         self._trt_opt_batch = trt_opt_batch
+        self._det_dynamic_batch = det_dynamic_batch
+        self._det_uint8_input = det_uint8_input
+        self._det_trt_max_batch = det_trt_max_batch
+        self._det_trt_opt_batch = det_trt_opt_batch
         self._pad_border_px = pad_fallback_border_px
         self._pad_fill = pad_fallback_fill
+        self._cv_pool = CvWorkPool(thread_workers)
+        # Serializes GPU passes when FACE_MAX_INFLIGHT lets several requests
+        # run their CPU stages concurrently. Held only around session.run-style
+        # calls, per chunk, so requests interleave at chunk granularity.
+        # Everything else touched concurrently is safe: CvWorkPool is a
+        # thread-safe executor, _det_center_cache worst-cases a duplicate
+        # compute under the GIL, and all blobs/buffers are per-call locals.
+        self._gpu_lock = threading.Lock()
+        self._det_center_cache: dict[int, np.ndarray] = {}
         self._app: Any = None
 
     def load_model(self) -> None:
@@ -153,6 +268,46 @@ class InsightFaceProvider(FaceProvider):
 
         log = structlog.get_logger()
 
+        # This service parallelizes cv2 work at image granularity (CvWorkPool)
+        # and at request granularity (FACE_MAX_INFLIGHT), so OpenCV's own
+        # nproc-wide parallel_for inside every resize/warpAffine/imdecode is
+        # pure thread contention — spawn-and-join of a 56-task barrier per
+        # 640px resize on a 56-core host, multiplied by pool workers and
+        # instances. Pin it to 1; our pools own the parallelism.
+        cv2.setNumThreads(1)
+
+        # Re-export the detector with a dynamic batch dim before any session is
+        # created, so one session.run covers a whole request batch (issue #126).
+        # ensure_available downloads the model pack if missing — the same call
+        # FaceAnalysis makes first thing in __init__, so no duplicate work.
+        import glob as _glob  # noqa: PLC0415
+        import os as _os  # noqa: PLC0415
+
+        if self._det_dynamic_batch:
+            from insightface.utils import ensure_available  # type: ignore[import-untyped]
+
+            from src.services.face_provider.scrfd_export import convert_scrfd_to_dynamic_batch  # noqa: PLC0415
+
+            pack_dir = ensure_available("models", self._model_name, root=_os.path.expanduser(self._model_dir))
+            for det_path in sorted(_glob.glob(_os.path.join(pack_dir, "det_*.onnx"))):
+                outcome = convert_scrfd_to_dynamic_batch(
+                    det_path, det_size=self._det_size, uint8_input=self._det_uint8_input
+                )
+                log.info("scrfd_dynamic_batch_export", model=det_path, outcome=outcome, uint8=self._det_uint8_input)
+        else:
+            # True rollback: restore the stock batch-1 graphs from their .bak
+            # so the flag doesn't just skip the export while a previously
+            # converted file keeps running. Consuming the .bak is idempotent —
+            # re-enabling the flag recreates it from the restored original.
+            pack_dir = _os.path.join(_os.path.expanduser(self._model_dir), "models", self._model_name)
+            for bak_path in sorted(_glob.glob(_os.path.join(pack_dir, "det_*.onnx.bak"))):
+                det_path = bak_path.removesuffix(".bak")
+                try:
+                    _os.replace(bak_path, det_path)
+                except FileNotFoundError:
+                    continue  # a concurrently restoring peer won the race
+                log.info("scrfd_dynamic_batch_restore", model=det_path)
+
         # Monkey-patch to inject SessionOptions into all insightface ORT sessions.
         # FaceAnalysis only forwards `providers` and `provider_options` to sessions,
         # not `sess_options` (model_zoo.py:94-96). This patch fills the gap.
@@ -160,6 +315,11 @@ class InsightFaceProvider(FaceProvider):
         _trt_on = self._use_gpu and self._use_tensorrt
         _opt_batch = self._trt_opt_batch
         _max_batch = self._trt_max_batch
+        _det_opt_batch = self._det_trt_opt_batch
+        _det_max_batch = self._det_trt_max_batch
+        # NCHW static dims of the re-exported detector — used to give it its
+        # own (smaller) TRT batch bounds; det_size is (W, H).
+        _det_static_dims = f"3x{self._det_size[1]}x{self._det_size[0]}"
 
         # Optional per-session ORT thread caps. ORT defaults intra_op_num_threads
         # to nproc *per session*; on a many-core host running N instances each
@@ -187,14 +347,23 @@ class InsightFaceProvider(FaceProvider):
                 if _inter > 0:
                     so.inter_op_num_threads = _inter
                 kwargs["sess_options"] = so
-            # Give dynamic-batch models (recognition, genderage) a TRT optimization
-            # profile so one engine covers batch [1, max] instead of rebuilding per
-            # face-count. Scoped per session via model_path: the detector and the
-            # recognizer share input name 'input.1' with incompatible shapes, so a
-            # global profile would break the detector — we copy provider_options
-            # and only amend the session whose model actually has a dynamic batch.
-            if _trt_on and _max_batch > 0 and "providers" in kwargs and "provider_options" in kwargs:
-                profile = _trt_batch_profile(model_path, _opt_batch, _max_batch)
+            # Give dynamic-batch models (recognition, genderage, and the
+            # re-exported detector) a TRT optimization profile so one engine
+            # covers batch [1, max] instead of rebuilding per batch size.
+            # Scoped per session via model_path: the detector and the
+            # recognizer share input name 'input.1' with incompatible shapes,
+            # so a global profile would break — we copy provider_options and
+            # only amend the session whose model actually has a dynamic batch.
+            profiles_wanted = _max_batch > 0 or _det_max_batch > 0
+            if _trt_on and profiles_wanted and "providers" in kwargs and "provider_options" in kwargs:
+                profile = _trt_batch_profile(
+                    model_path,
+                    _opt_batch,
+                    _max_batch,
+                    det_static_dims=_det_static_dims,
+                    det_opt_batch=_det_opt_batch,
+                    det_max_batch=_det_max_batch,
+                )
                 providers = list(kwargs["providers"])
                 if profile and "TensorrtExecutionProvider" in providers:
                     idx = providers.index("TensorrtExecutionProvider")
@@ -250,7 +419,8 @@ class InsightFaceProvider(FaceProvider):
         return cv2.imdecode(arr, cv2.IMREAD_COLOR)
 
     def _detect_faces(self, img: np.ndarray) -> tuple[np.ndarray, np.ndarray | None]:
-        bboxes, kpss = self._app.det_model.detect(img, max_num=0, metric="default")
+        with self._gpu_lock:
+            bboxes, kpss = self._app.det_model.detect(img, max_num=0, metric="default")
         return bboxes, kpss
 
     def _pad_to_square(self, img: np.ndarray) -> tuple[np.ndarray, int, int]:
@@ -262,21 +432,241 @@ class InsightFaceProvider(FaceProvider):
         canvas[dy : dy + h, dx : dx + w] = img
         return canvas, dx, dy
 
-    def _detect_with_pad_fallback(self, img: np.ndarray) -> tuple[np.ndarray, np.ndarray | None, np.ndarray, int, int]:
-        """Detect faces; on miss, pad to square and retry once.
+    def _det_batch_capable(self) -> bool:
+        """True if the loaded detector graph supports batched inference: a
+        dynamic batch dim with static spatial dims (see ``scrfd_export``), on a
+        detector exposing the SCRFD decode attributes. Anything else — stock
+        batch-1 graphs included — falls back to the per-image detect loop."""
+        det_model = self._app.det_model
+        if not isinstance(getattr(det_model, "fmc", None), int):
+            return False
+        shape = det_model.session.get_inputs()[0].shape
+        return (
+            isinstance(shape, (list, tuple))
+            and len(shape) == 4
+            and not isinstance(shape[0], int)
+            and isinstance(shape[2], int)
+            and isinstance(shape[3], int)
+        )
 
-        Returns (bboxes, kpss, working_img, dx, dy). Coordinates in bboxes/kpss
-        are in working_img space — alignment must use working_img, but bboxes
-        and landmarks emitted to clients must be translated back via
-        _translate_bbox / _translate_landmarks using (dx, dy) and the original
-        frame dimensions.
+    def _letterbox(self, img: np.ndarray) -> tuple[np.ndarray, float]:
+        """Aspect-preserving resize onto a det_size canvas (top-left anchored),
+        exactly mirroring insightface's SCRFD.detect preprocessing."""
+        input_w, input_h = self._det_input_size()
+        im_ratio = float(img.shape[0]) / img.shape[1]
+        model_ratio = float(input_h) / input_w
+        if im_ratio > model_ratio:
+            new_height = input_h
+            new_width = int(new_height / im_ratio)
+        else:
+            new_width = input_w
+            new_height = int(new_width * im_ratio)
+        det_scale = float(new_height) / img.shape[0]
+        resized = cv2.resize(img, (new_width, new_height))
+        det_img = np.zeros((input_h, input_w, 3), dtype=np.uint8)
+        det_img[:new_height, :new_width, :] = resized
+        return det_img, det_scale
+
+    def _det_anchor_centers(self, stride: int) -> np.ndarray:
+        """Anchor-center grid for one FPN stride; input size is static in the
+        batched graph so one cache entry per stride is enough."""
+        cached = self._det_center_cache.get(stride)
+        if cached is not None:
+            return cached
+        det_model = self._app.det_model
+        input_w, input_h = self._det_input_size()
+        height, width = input_h // stride, input_w // stride
+        grid = np.mgrid[:height, :width]
+        centers = np.stack((grid[1], grid[0]), axis=-1).astype(np.float32)
+        centers = (centers * stride).reshape((-1, 2))
+        if det_model._num_anchors > 1:
+            centers = np.stack([centers] * det_model._num_anchors, axis=1).reshape((-1, 2))
+        self._det_center_cache[stride] = centers
+        return centers
+
+    def _decode_det_output(
+        self, net_outs: list[np.ndarray], b: int, det_scale: float
+    ) -> tuple[np.ndarray, np.ndarray | None]:
+        """Decode one image's slice of a batched SCRFD forward pass into
+        (bboxes, kpss), mirroring SCRFD.forward + SCRFD.detect post-processing.
+
+        The converted graph keeps the stock flat 2-D outputs, so a batch of N
+        yields (N*K, C) per stride with image b occupying rows [b*K:(b+1)*K].
         """
-        bboxes, kpss = self._detect_faces(img)
-        if bboxes.shape[0] > 0:
-            return bboxes, kpss, img, 0, 0
-        padded, dx, dy = self._pad_to_square(img)
-        bboxes, kpss = self._detect_faces(padded)
-        return bboxes, kpss, padded, dx, dy
+        from insightface.model_zoo.scrfd import (  # type: ignore[import-untyped] # noqa: PLC0415
+            distance2bbox,
+            distance2kps,
+        )
+
+        det_model = self._app.det_model
+        input_w, input_h = self._det_input_size()
+        fmc = det_model.fmc
+        scores_list: list[np.ndarray] = []
+        bboxes_list: list[np.ndarray] = []
+        kpss_list: list[np.ndarray] = []
+        for idx, stride in enumerate(det_model._feat_stride_fpn):
+            k = (input_h // stride) * (input_w // stride) * det_model._num_anchors
+            rows = slice(b * k, (b + 1) * k)
+            scores = net_outs[idx][rows]
+            anchor_centers = self._det_anchor_centers(stride)
+            pos_inds = np.where(scores >= det_model.det_thresh)[0]
+            # Unlike insightface's forward(), decode only the anchors above
+            # threshold — distance2bbox/kps are row-wise, so results are
+            # identical and the per-image cost drops from ~25k anchors to a
+            # handful.
+            bbox_preds = net_outs[idx + fmc][rows][pos_inds] * stride
+            bboxes = distance2bbox(anchor_centers[pos_inds], bbox_preds)
+            scores_list.append(scores[pos_inds])
+            bboxes_list.append(bboxes)
+            if det_model.use_kps:
+                kps_preds = net_outs[idx + fmc * 2][rows][pos_inds] * stride
+                kpss = distance2kps(anchor_centers[pos_inds], kps_preds)
+                kpss_list.append(kpss.reshape((kpss.shape[0], kpss.shape[1] // 2, 2)))
+
+        scores_all = np.vstack(scores_list)
+        order = scores_all.ravel().argsort()[::-1]
+        bboxes_all = np.vstack(bboxes_list) / det_scale
+        pre_det = np.hstack((bboxes_all, scores_all)).astype(np.float32, copy=False)
+        pre_det = pre_det[order, :]
+        keep = det_model.nms(pre_det)
+        det = pre_det[keep, :]
+        if det_model.use_kps:
+            kpss_all = np.vstack(kpss_list) / det_scale
+            return det, kpss_all[order, :, :][keep, :, :]
+        return det, None
+
+    def _det_input_size(self) -> tuple[int, int]:
+        """(W, H) of the detector graph input, layout-aware: converted graphs
+        are NCHW float or NHWC uint8. Falls back to insightface's parsed value
+        for stock (non-batch-capable) graphs, which never reach this path."""
+        shape = self._app.det_model.session.get_inputs()[0].shape
+        if isinstance(shape, (list, tuple)) and len(shape) == 4 and isinstance(shape[2], int):
+            if shape[3] == 3:  # NHWC
+                return (shape[2], shape[1])
+            return (shape[3], shape[2])  # NCHW
+        return self._app.det_model.input_size  # type: ignore[no-any-return]
+
+    def _det_input_is_uint8(self) -> bool:
+        """True if the detector graph carries its own normalization and takes
+        raw uint8 BGR NCHW canvases (see scrfd_export uint8_input)."""
+        return bool(self._app.det_model.session.get_inputs()[0].type == "tensor(uint8)")
+
+    def _letterbox_blob(self, img: np.ndarray) -> tuple[np.ndarray, float]:
+        """Letterbox one image and convert it to a (1, 3, H, W) network blob.
+
+        Per-image ``blobFromImage`` (which releases the GIL, so it threads
+        well) is ~5x faster than one ``blobFromImages`` call over the whole
+        batch, and bit-identical to insightface's own preprocessing.
+        """
+        det_model = self._app.det_model
+        det_img, det_scale = self._letterbox(img)
+        input_w, input_h = self._det_input_size()
+        blob: np.ndarray = cv2.dnn.blobFromImage(
+            det_img,
+            1.0 / det_model.input_std,
+            (input_w, input_h),
+            (det_model.input_mean, det_model.input_mean, det_model.input_mean),
+            swapRB=True,
+        )
+        return blob, det_scale
+
+    def _detect_faces_batched(self, imgs: list[np.ndarray]) -> list[tuple[np.ndarray, np.ndarray | None]]:
+        """Detect faces in N images with one session.run per chunk instead of
+        one per image. Chunk size is bounded by the detector's TRT profile max
+        so every run stays inside the prebuilt engine.
+
+        Workers write each image's blob straight into its slice of one
+        preallocated (N, 3, H, W) array — a serial np.concatenate over the
+        batch costs more than the forward pass itself.
+        """
+        det_model = self._app.det_model
+        n = len(imgs)
+        input_w, input_h = self._det_input_size()
+        uint8_input = self._det_input_is_uint8()
+        in_shape = det_model.session.get_inputs()[0].shape
+        nhwc = uint8_input and isinstance(in_shape, (list, tuple)) and in_shape[3] == 3
+        if nhwc:
+            blob = np.empty((n, input_h, input_w, 3), dtype=np.uint8)
+        elif uint8_input:
+            blob = np.empty((n, 3, input_h, input_w), dtype=np.uint8)
+        else:
+            blob = np.empty((n, 3, input_h, input_w), dtype=np.float32)
+        det_scales = [0.0] * n
+
+        def _fill(i: int) -> None:
+            if nhwc:
+                # Normalization AND the NCHW transpose live in the graph — the
+                # letterboxed BGR canvas is copied contiguously as-is (a CHW
+                # transpose here is a strided 3-plane gather, ~7x slower).
+                det_img, det_scale = self._letterbox(imgs[i])
+                blob[i] = det_img
+            elif uint8_input:
+                det_img, det_scale = self._letterbox(imgs[i])
+                blob[i] = det_img.transpose(2, 0, 1)
+            else:
+                img_blob, det_scale = self._letterbox_blob(imgs[i])
+                blob[i] = img_blob[0]
+            det_scales[i] = det_scale
+
+        self._cv_pool.map(_fill, range(n))
+
+        max_b = self._det_trt_max_batch if self._det_trt_max_batch > 0 else n
+        results: list[tuple[np.ndarray, np.ndarray | None]] = []
+        for start in range(0, n, max_b):
+            chunk = blob[start : start + max_b]
+            with self._gpu_lock:
+                net_outs = det_model.session.run(det_model.output_names, {det_model.input_name: chunk})
+            for b in range(chunk.shape[0]):
+                results.append(self._decode_det_output(net_outs, b, det_scales[start + b]))
+        return results
+
+    def _detect_batch(self, imgs: list[np.ndarray]) -> list[tuple[np.ndarray, np.ndarray | None]]:
+        """Batched detection when the graph supports it, sequential otherwise."""
+        if not imgs:
+            return []
+        if self._det_batch_capable():
+            return self._detect_faces_batched(imgs)
+        return [self._detect_faces(img) for img in imgs]
+
+    def _detect_with_pad_fallback_batch(self, decoded: list[np.ndarray | None]) -> list[_DetResult]:
+        """Detect faces across a batch; images with zero faces get one batched
+        retry on a padded-to-square copy (see the pad-fallback note above).
+
+        Coordinates in bboxes/kpss are in working_img space — alignment must
+        use working_img, but bboxes and landmarks emitted to clients must be
+        translated back via _make_bbox / _kps_to_landmarks using (dx, dy) and
+        the original frame dimensions. Undecodable (None) images yield empty
+        entries.
+        """
+        results: list[_DetResult | None] = [None] * len(decoded)
+        valid = [i for i, img in enumerate(decoded) if img is not None]
+
+        first_pass = self._detect_batch([decoded[i] for i in valid])  # type: ignore[misc]
+        misses: list[int] = []
+        for i, (bboxes, kpss) in zip(valid, first_pass, strict=True):
+            img = decoded[i]
+            assert img is not None
+            if bboxes.shape[0] > 0:
+                results[i] = (bboxes, kpss, img, 0, 0, img.shape[0], img.shape[1])
+            else:
+                misses.append(i)
+
+        if misses:
+            padded = [self._pad_to_square(decoded[i]) for i in misses]  # type: ignore[arg-type]
+            second_pass = self._detect_batch([canvas for canvas, _, _ in padded])
+            for i, (canvas, dx, dy), (bboxes, kpss) in zip(misses, padded, second_pass, strict=True):
+                img = decoded[i]
+                assert img is not None
+                results[i] = (bboxes, kpss, canvas, dx, dy, img.shape[0], img.shape[1])
+
+        empty: _DetResult = (np.zeros((0, 5), dtype=np.float32), None, None, 0, 0, 0, 0)
+        return [r if r is not None else empty for r in results]
+
+    def _detect_with_pad_fallback(self, img: np.ndarray) -> tuple[np.ndarray, np.ndarray | None, np.ndarray, int, int]:
+        """Single-image wrapper over the batched pad-fallback path."""
+        bboxes, kpss, working, dx, dy, _, _ = self._detect_with_pad_fallback_batch([img])[0]
+        assert working is not None
+        return bboxes, kpss, working, dx, dy
 
     @staticmethod
     def _make_bbox(raw_bbox: np.ndarray, dx: int = 0, dy: int = 0, orig_w: int = 0, orig_h: int = 0) -> BoundingBox:
@@ -304,16 +694,116 @@ class InsightFaceProvider(FaceProvider):
         """
         max_b = self._trt_max_batch
         if max_b <= 0 or len(crops) <= max_b:
-            return rec_model.get_feat(crops)  # type: ignore[no-any-return]
-        feats = [rec_model.get_feat(crops[i : i + max_b]) for i in range(0, len(crops), max_b)]
+            with self._gpu_lock:
+                return rec_model.get_feat(crops)  # type: ignore[no-any-return]
+        feats = []
+        for i in range(0, len(crops), max_b):
+            with self._gpu_lock:
+                feats.append(rec_model.get_feat(crops[i : i + max_b]))
         return np.concatenate(feats, axis=0)
+
+    @staticmethod
+    def _ga_batch_capable(ga_model: Any) -> bool:
+        """True if the genderage model can take a batched forward pass: the
+        stock graph already has a dynamic batch dim (`[None,3,96,96]`), so this
+        mostly guards against test doubles and exotic model packs."""
+        if getattr(ga_model, "taskname", None) != "genderage":
+            return False
+        shape = ga_model.session.get_inputs()[0].shape
+        return (
+            isinstance(shape, (list, tuple))
+            and len(shape) == 4
+            and not isinstance(shape[0], int)
+            and isinstance(shape[2], int)
+            and isinstance(shape[3], int)
+        )
+
+    @staticmethod
+    def _ga_crop(img: np.ndarray, bbox: np.ndarray, size: int) -> np.ndarray:
+        """Center-crop a face for the genderage model — numpy equivalent of
+        insightface's face_align.transform with rotation 0 (skimage-free, and
+        cv2.warpAffine releases the GIL so it threads well)."""
+        w, h = bbox[2] - bbox[0], bbox[3] - bbox[1]
+        cx, cy = (bbox[0] + bbox[2]) / 2, (bbox[1] + bbox[3]) / 2
+        s = size / (max(w, h) * 1.5)
+        mat = np.array([[s, 0.0, size / 2 - s * cx], [0.0, s, size / 2 - s * cy]], dtype=np.float64)
+        return cv2.warpAffine(img, mat, (size, size), borderValue=0.0)
+
+    def _genderage_batch(
+        self, ga_model: Any, tasks: list[tuple[np.ndarray, np.ndarray]]
+    ) -> list[tuple[float | None, str | None]]:
+        """Run genderage over (working_img, bbox) pairs with one session.run
+        per chunk instead of one per face. Crops mirror Attribute.get exactly;
+        chunking is bounded by the shared TRT profile max (same as recognition).
+        """
+        size = ga_model.input_size[0]
+        n = len(tasks)
+        blob = np.empty((n, 3, size, size), dtype=np.float32)
+
+        def _fill(i: int) -> None:
+            img, bbox = tasks[i]
+            aimg = self._ga_crop(img, bbox, size)
+            blob[i] = cv2.dnn.blobFromImage(
+                aimg,
+                1.0 / ga_model.input_std,
+                (size, size),
+                (ga_model.input_mean, ga_model.input_mean, ga_model.input_mean),
+                swapRB=True,
+            )[0]
+
+        self._cv_pool.map(_fill, range(n))
+
+        max_b = self._trt_max_batch if self._trt_max_batch > 0 else n
+        results: list[tuple[float | None, str | None]] = []
+        for start in range(0, n, max_b):
+            with self._gpu_lock:
+                preds = ga_model.session.run(ga_model.output_names, {ga_model.input_name: blob[start : start + max_b]})[
+                    0
+                ]
+            for pred in preds:
+                age = float(int(np.round(pred[2] * 100)))
+                gender = "male" if int(np.argmax(pred[:2])) == 1 else "female"
+                results.append((age, gender))
+        return results
+
+    def _genderage_for_image(
+        self, ga_model: Any, working: np.ndarray, bboxes: np.ndarray, kpss: np.ndarray | None
+    ) -> list[tuple[float | None, str | None]]:
+        """Genderage for all faces of one image: batched when the graph allows
+        it, per-face Attribute.get otherwise (also the path test doubles hit)."""
+        if self._ga_batch_capable(ga_model):
+            return self._genderage_batch(ga_model, [(working, bboxes[i, :4]) for i in range(bboxes.shape[0])])
+        results: list[tuple[float | None, str | None]] = []
+        for i in range(bboxes.shape[0]):
+            face_obj = _FaceProxy(bbox=bboxes[i, :4], kps=kpss[i] if kpss is not None else None)
+            with self._gpu_lock:
+                ga_model.get(working, face_obj)
+            age = _to_float(face_obj.get("age"))
+            gender_val = face_obj.get("gender")
+            gender: str | None = None
+            if gender_val is not None:
+                try:
+                    gender = "male" if int(gender_val) == 1 else "female"  # type: ignore[call-overload]
+                except (TypeError, ValueError):
+                    gender = str(gender_val)
+            results.append((age, gender))
+        return results
+
+    def _aligned_crops(self, tasks: list[tuple[np.ndarray, np.ndarray]], image_size: int) -> list[np.ndarray]:
+        """Warp all (working_img, landmarks) face crops of a request: the
+        affine matrices come from one vectorized solve, the warps run on the
+        shared pool (cv2.warpAffine releases the GIL)."""
+        if not tasks:
+            return []
+        mats = _estimate_norms_batch(np.stack([kps for _, kps in tasks]), image_size)
+        return self._cv_pool.map(
+            lambda i: cv2.warpAffine(tasks[i][0], mats[i], (image_size, image_size), borderValue=0.0),
+            range(len(tasks)),
+        )
 
     def _align_and_embed(self, img: np.ndarray, kpss: np.ndarray) -> np.ndarray:
         rec_model = self._app.models["recognition"]
-        crops = []
-        for kps in kpss:
-            aimg = _norm_crop(img, landmark=kps, image_size=rec_model.input_size[0])
-            crops.append(aimg)
+        crops = self._aligned_crops([(img, kps) for kps in kpss], rec_model.input_size[0])
         embeddings: np.ndarray = self._recognize(rec_model, crops)
         norms = np.linalg.norm(embeddings, axis=1, keepdims=True)
         norms = np.maximum(norms, 1e-10)
@@ -336,7 +826,8 @@ class InsightFaceProvider(FaceProvider):
         poses: list[HeadPose | None] = []
         for i in range(bboxes.shape[0]):
             face_obj = _FaceProxy(bbox=bboxes[i, :4], kps=kpss[i] if kpss is not None else None)
-            pose_model.get(img, face_obj)
+            with self._gpu_lock:
+                pose_model.get(img, face_obj)
             poses.append(_to_pose(face_obj.get("pose")))
         return poses
 
@@ -346,21 +837,14 @@ class InsightFaceProvider(FaceProvider):
             return []
         return self._detect_decoded(img, include_pose)
 
-    def detect_batch(self, images: list[bytes], include_pose: bool = False) -> list[list[DetectedFace]]:
-        with ThreadPoolExecutor(max_workers=_BATCH_THREAD_WORKERS) as pool:
-            decoded = list(pool.map(self._decode_image, images))
-        return [[] if img is None else self._detect_decoded(img, include_pose) for img in decoded]
-
     def _detect_decoded(self, img: np.ndarray, include_pose: bool) -> list[DetectedFace]:
         bboxes, kpss, working, dx, dy = self._detect_with_pad_fallback(img)
         if bboxes.shape[0] == 0:
             return []
 
-        poses: list[HeadPose | None]
-        if include_pose:
-            poses = self._estimate_poses(working, bboxes, kpss)
-        else:
-            poses = [None] * bboxes.shape[0]
+        poses: list[HeadPose | None] = (
+            self._estimate_poses(working, bboxes, kpss) if include_pose else [None] * bboxes.shape[0]
+        )
         orig_h, orig_w = img.shape[:2]
         return [
             DetectedFace(
@@ -408,34 +892,52 @@ class InsightFaceProvider(FaceProvider):
         embeddings = self._align_and_embed(working, kpss)
         ga_model = self._app.models.get("genderage")
 
+        demographics: list[tuple[float | None, str | None]]
+        if ga_model is not None:
+            demographics = self._genderage_for_image(ga_model, working, bboxes, kpss)
+        else:
+            demographics = [(None, None)] * bboxes.shape[0]
+
         orig_h, orig_w = img.shape[:2]
-        results: list[DetectedFace] = []
-        for i in range(bboxes.shape[0]):
-            age: float | None = None
-            gender: str | None = None
-
-            if ga_model is not None:
-                face_obj = _FaceProxy(bbox=bboxes[i, :4], kps=kpss[i] if kpss is not None else None)
-                ga_model.get(working, face_obj)
-                age = _to_float(face_obj.get("age"))
-                gender_val = face_obj.get("gender")
-                if gender_val is not None:
-                    try:
-                        gender = "male" if int(gender_val) == 1 else "female"  # type: ignore[call-overload]
-                    except (TypeError, ValueError):
-                        gender = str(gender_val)
-
-            results.append(
-                DetectedFace(
-                    bbox=self._make_bbox(bboxes[i, :4], dx, dy, orig_w, orig_h),
-                    det_score=float(bboxes[i, 4]),
-                    embedding=embeddings[i].astype(np.float32).tolist(),
-                    age=age,
-                    gender=gender,
-                    landmarks=self._kps_to_landmarks(kpss[i], dx, dy),
-                )
+        return [
+            DetectedFace(
+                bbox=self._make_bbox(bboxes[i, :4], dx, dy, orig_w, orig_h),
+                det_score=float(bboxes[i, 4]),
+                embedding=embeddings[i].astype(np.float32).tolist(),
+                age=demographics[i][0],
+                gender=demographics[i][1],
+                landmarks=self._kps_to_landmarks(kpss[i], dx, dy),
             )
+            for i in range(bboxes.shape[0])
+        ]
 
+    def detect_batch(self, images: list[bytes], include_pose: bool = False) -> list[list[DetectedFace]]:
+        # Stage 1: Decode images in parallel (cv2.imdecode releases the GIL)
+        decoded = self._cv_pool.decode_batch(self._decode_image, images)
+
+        # Stage 2: One batched detection pass, plus one batched pad-retry pass
+        # over the zero-face subset.
+        per_image = self._detect_with_pad_fallback_batch(decoded)
+
+        results: list[list[DetectedFace]] = []
+        for bboxes, kpss, working, dx, dy, orig_h, orig_w in per_image:
+            if bboxes.shape[0] == 0 or working is None:
+                results.append([])
+                continue
+            poses: list[HeadPose | None] = (
+                self._estimate_poses(working, bboxes, kpss) if include_pose else [None] * bboxes.shape[0]
+            )
+            results.append(
+                [
+                    DetectedFace(
+                        bbox=self._make_bbox(bboxes[i, :4], dx, dy, orig_w, orig_h),
+                        det_score=float(bboxes[i, 4]),
+                        landmarks=self._kps_to_landmarks(kpss[i] if kpss is not None else None, dx, dy),
+                        pose=poses[i],
+                    )
+                    for i in range(bboxes.shape[0])
+                ]
+            )
         return results
 
     def embed_batch(self, images: list[bytes]) -> list[list[DetectedFace]]:
@@ -443,18 +945,11 @@ class InsightFaceProvider(FaceProvider):
         image_size = rec_model.input_size[0]
 
         # Stage 1: Decode images in parallel (cv2.imdecode releases the GIL)
-        with ThreadPoolExecutor(max_workers=_BATCH_THREAD_WORKERS) as pool:
-            decoded = list(pool.map(self._decode_image, images))
+        decoded = self._cv_pool.decode_batch(self._decode_image, images)
 
-        # Stage 2: Detect faces (GPU, must be sequential). On miss, retry once
-        # on a padded copy — same fallback as the single-image path.
-        per_image: list[tuple[np.ndarray, np.ndarray | None, np.ndarray | None, int, int, int, int]] = []
-        for img in decoded:
-            if img is None:
-                per_image.append((np.zeros((0, 5)), None, None, 0, 0, 0, 0))
-            else:
-                bboxes, kpss, working, dx, dy = self._detect_with_pad_fallback(img)
-                per_image.append((bboxes, kpss, working, dx, dy, img.shape[0], img.shape[1]))
+        # Stage 2: One batched detection pass, plus one batched pad-retry pass
+        # over the zero-face subset.
+        per_image = self._detect_with_pad_fallback_batch(decoded)
 
         # Stage 3: Align face crops in parallel (_norm_crop releases the GIL)
         all_crops: list[np.ndarray] = []
@@ -470,8 +965,7 @@ class InsightFaceProvider(FaceProvider):
             crop_counts.append(it_bboxes.shape[0])
 
         if align_tasks:
-            with ThreadPoolExecutor(max_workers=_BATCH_THREAD_WORKERS) as pool:
-                all_crops = list(pool.map(lambda t: _norm_crop(t[0], t[1], image_size), align_tasks))
+            all_crops = self._aligned_crops(align_tasks, image_size)
 
         if all_crops:
             all_embeddings: np.ndarray = self._recognize(rec_model, all_crops)
@@ -507,18 +1001,11 @@ class InsightFaceProvider(FaceProvider):
         image_size = rec_model.input_size[0]
 
         # Stage 1: Decode images in parallel (cv2.imdecode releases the GIL)
-        with ThreadPoolExecutor(max_workers=_BATCH_THREAD_WORKERS) as pool:
-            decoded = list(pool.map(self._decode_image, images))
+        decoded = self._cv_pool.decode_batch(self._decode_image, images)
 
-        # Stage 2: Detect faces (GPU, must be sequential). On miss, retry once
-        # on a padded copy.
-        per_image: list[tuple[np.ndarray, np.ndarray | None, np.ndarray | None, int, int, int, int]] = []
-        for img in decoded:
-            if img is None:
-                per_image.append((np.zeros((0, 5)), None, None, 0, 0, 0, 0))
-            else:
-                bboxes, kpss, working, dx, dy = self._detect_with_pad_fallback(img)
-                per_image.append((bboxes, kpss, working, dx, dy, img.shape[0], img.shape[1]))
+        # Stage 2: One batched detection pass, plus one batched pad-retry pass
+        # over the zero-face subset.
+        per_image = self._detect_with_pad_fallback_batch(decoded)
 
         # Stage 3: Align face crops in parallel (_norm_crop releases the GIL)
         all_crops: list[np.ndarray] = []
@@ -534,8 +1021,7 @@ class InsightFaceProvider(FaceProvider):
             crop_counts.append(it_bboxes.shape[0])
 
         if align_tasks:
-            with ThreadPoolExecutor(max_workers=_BATCH_THREAD_WORKERS) as pool:
-                all_crops = list(pool.map(lambda t: _norm_crop(t[0], t[1], image_size), align_tasks))
+            all_crops = self._aligned_crops(align_tasks, image_size)
 
         if all_crops:
             all_embeddings: np.ndarray = self._recognize(rec_model, all_crops)
@@ -545,34 +1031,43 @@ class InsightFaceProvider(FaceProvider):
         else:
             all_embeddings = np.zeros((0, 512), dtype=np.float32)
 
+        # Genderage across ALL faces of the request in one batched pass (one
+        # session.run per chunk instead of one per face); falls back to
+        # per-image Attribute.get when the graph can't batch. Task order
+        # mirrors the crop/embedding order, so emb_offset indexes both.
+        demographics: list[tuple[float | None, str | None]] = []
+        if ga_model is not None and all_crops:
+            if self._ga_batch_capable(ga_model):
+                ga_tasks: list[tuple[np.ndarray, np.ndarray]] = []
+                for idx, it in enumerate(per_image):
+                    it_bboxes, it_working = it[0], it[2]
+                    if crop_counts[idx] and it_working is not None:
+                        ga_tasks.extend((it_working, it_bboxes[i, :4]) for i in range(crop_counts[idx]))
+                demographics = self._genderage_batch(ga_model, ga_tasks)
+            else:
+                for idx, it in enumerate(per_image):
+                    it_bboxes, it_kpss, it_working = it[0], it[1], it[2]
+                    if crop_counts[idx] and it_working is not None:
+                        demographics.extend(
+                            self._genderage_for_image(ga_model, it_working, it_bboxes[: crop_counts[idx]], it_kpss)
+                        )
+        else:
+            demographics = [(None, None)] * len(all_crops)
+
         results: list[list[DetectedFace]] = []
         emb_offset = 0
         for idx, it in enumerate(per_image):
-            it_bboxes, it_kpss, it_working, it_dx, it_dy, it_oh, it_ow = it
+            it_bboxes, it_kpss, _, it_dx, it_dy, it_oh, it_ow = it
             n = crop_counts[idx]
             faces: list[DetectedFace] = []
             for i in range(n):
-                age: float | None = None
-                gender: str | None = None
-
-                if ga_model is not None and it_working is not None and it_kpss is not None:
-                    face_obj = _FaceProxy(bbox=it_bboxes[i, :4], kps=it_kpss[i])
-                    ga_model.get(it_working, face_obj)
-                    age = _to_float(face_obj.get("age"))
-                    gender_val = face_obj.get("gender")
-                    if gender_val is not None:
-                        try:
-                            gender = "male" if int(gender_val) == 1 else "female"  # type: ignore[call-overload]
-                        except (TypeError, ValueError):
-                            gender = str(gender_val)
-
                 faces.append(
                     DetectedFace(
                         bbox=self._make_bbox(it_bboxes[i, :4], it_dx, it_dy, it_ow, it_oh),
                         det_score=float(it_bboxes[i, 4]),
                         embedding=all_embeddings[emb_offset + i].astype(np.float32).tolist(),
-                        age=age,
-                        gender=gender,
+                        age=demographics[emb_offset + i][0],
+                        gender=demographics[emb_offset + i][1],
                         landmarks=self._kps_to_landmarks(it_kpss[i] if it_kpss is not None else None, it_dx, it_dy),
                     )
                 )

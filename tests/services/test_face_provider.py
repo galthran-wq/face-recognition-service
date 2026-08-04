@@ -1,3 +1,4 @@
+import os
 from unittest.mock import MagicMock, patch
 
 import numpy as np
@@ -202,7 +203,9 @@ class TestInsightFaceProviderLoadModel:
         mock_instance = MagicMock()
         mock_fa_cls.return_value = mock_instance
 
-        provider = InsightFaceProvider(use_gpu=False, det_size=(320, 320), model_name="buffalo_l")
+        provider = InsightFaceProvider(
+            use_gpu=False, det_size=(320, 320), model_name="buffalo_l", det_dynamic_batch=False
+        )
         provider.load_model()
 
         mock_fa_cls.assert_called_once_with(
@@ -216,7 +219,7 @@ class TestInsightFaceProviderLoadModel:
         mock_instance = MagicMock()
         mock_fa_cls.return_value = mock_instance
 
-        provider = InsightFaceProvider(use_gpu=True, ctx_id=1)
+        provider = InsightFaceProvider(use_gpu=True, ctx_id=1, det_dynamic_batch=False)
         provider.load_model()
 
         mock_fa_cls.assert_called_once_with(
@@ -235,6 +238,35 @@ class TestInsightFaceProviderLoadModel:
             ],
         )
         mock_instance.prepare.assert_called_once_with(ctx_id=1, det_size=(640, 640))
+
+    @patch("insightface.app.FaceAnalysis", autospec=False)
+    def test_load_model_converts_detector_to_dynamic_batch(self, mock_fa_cls: MagicMock) -> None:
+        mock_fa_cls.return_value = MagicMock()
+
+        with (
+            patch("insightface.utils.ensure_available", return_value="/fake/pack") as mock_ensure,
+            patch("glob.glob", return_value=["/fake/pack/det_10g.onnx"]) as mock_glob,
+            patch(
+                "src.services.face_provider.scrfd_export.convert_scrfd_to_dynamic_batch",
+                return_value="converted",
+            ) as mock_convert,
+        ):
+            provider = InsightFaceProvider(use_gpu=False, det_size=(640, 640), model_name="buffalo_l")
+            provider.load_model()
+
+        mock_ensure.assert_called_once_with("models", "buffalo_l", root=os.path.expanduser("~/.insightface"))
+        mock_glob.assert_called_once_with("/fake/pack/det_*.onnx")
+        mock_convert.assert_called_once_with("/fake/pack/det_10g.onnx", det_size=(640, 640), uint8_input=True)
+
+    @patch("insightface.app.FaceAnalysis", autospec=False)
+    def test_load_model_skips_conversion_when_disabled(self, mock_fa_cls: MagicMock) -> None:
+        mock_fa_cls.return_value = MagicMock()
+
+        with patch("insightface.utils.ensure_available") as mock_ensure:
+            provider = InsightFaceProvider(use_gpu=False, det_dynamic_batch=False)
+            provider.load_model()
+
+        mock_ensure.assert_not_called()
 
     def test_provider_name(self) -> None:
         provider = InsightFaceProvider()
@@ -428,6 +460,23 @@ class TestPadSquareFallback:
         assert len(captured) == 1
         assert captured[0].shape == (300, 300, 3)
 
+    def test_detect_batch_fallback_per_image(self) -> None:
+        # detect_batch on a non-batch-capable graph: sequential detects with
+        # the same per-image pad retry as embed_batch/analyze_batch.
+        provider, mock_app = _create_provider_with_mock()
+        first_hit = _make_det_output()
+        retry_hit = _make_det_output([{"bbox": [110.0, 120.0, 180.0, 190.0], "det_score": 0.9}])
+        mock_app.det_model.detect.side_effect = [first_hit, _empty_det_output(), retry_hit]
+
+        results = provider.detect_batch([_fake_image_bytes(), _fake_image_bytes()])
+
+        assert len(results) == 2
+        assert results[0][0].bbox.x == 10.0
+        assert results[1][0].bbox.x == 10.0  # translated from padded coords
+        assert results[1][0].bbox.y == 20.0
+        assert results[0][0].embedding is None
+        assert mock_app.det_model.detect.call_count == 3
+
     def test_analyze_batch_fallback_per_image(self) -> None:
         # Mirror of test_embed_batch_fallback_per_image for the analyze path.
         provider, mock_app = _create_provider_with_mock()
@@ -457,3 +506,568 @@ class TestPadSquareFallback:
         assert results[1][0].age == 40.0
         assert results[1][0].gender == "male"
         assert mock_app.det_model.detect.call_count == 3
+
+
+# --- Dynamic-batch SCRFD detection (issue #126) ---
+
+_DET_STRIDES = [8, 16, 32]
+_DET_ANCHORS_PER_CELL = 2
+_DET_INPUT = 640
+
+
+def _stride_anchor_count(stride: int) -> int:
+    cells = (_DET_INPUT // stride) ** 2
+    return cells * _DET_ANCHORS_PER_CELL
+
+
+def _craft_scrfd_net_outs(
+    faces_per_image: list[list[tuple[tuple[float, float, float, float], float]]],
+) -> list[np.ndarray]:
+    """Build raw batched SCRFD outputs (3 score maps, 3 bbox maps, 3 kps maps,
+    each flat (N*K, C) — the converted graph keeps the stock 2-D layout, with
+    image b occupying rows [b*K:(b+1)*K]) that decode to the given per-image
+    (bbox, score) faces.
+
+    Bboxes are in letterboxed 640x640 canvas space; every face is planted on
+    the stride-8 anchor whose cell contains the bbox center, with all 5
+    keypoints at the bbox center.
+    """
+    n = len(faces_per_image)
+    outs: dict[int, tuple[np.ndarray, np.ndarray, np.ndarray]] = {
+        s: (
+            np.zeros((n, _stride_anchor_count(s), 1), dtype=np.float32),
+            np.zeros((n, _stride_anchor_count(s), 4), dtype=np.float32),
+            np.zeros((n, _stride_anchor_count(s), 10), dtype=np.float32),
+        )
+        for s in _DET_STRIDES
+    }
+    scores, bbox_preds, kps_preds = outs[8]
+    width_cells = _DET_INPUT // 8
+    for b, faces in enumerate(faces_per_image):
+        for (x1, y1, x2, y2), score in faces:
+            cx, cy = (x1 + x2) / 2, (y1 + y2) / 2
+            col, row = int(cx // 8), int(cy // 8)
+            j = (row * width_cells + col) * _DET_ANCHORS_PER_CELL
+            acx, acy = col * 8.0, row * 8.0
+            scores[b, j, 0] = score
+            bbox_preds[b, j] = [(acx - x1) / 8, (acy - y1) / 8, (x2 - acx) / 8, (y2 - acy) / 8]
+            for p in range(5):
+                kps_preds[b, j, 2 * p] = (cx - acx) / 8
+                kps_preds[b, j, 2 * p + 1] = (cy - acy) / 8
+    flat = [outs[s][0].reshape(-1, 1) for s in _DET_STRIDES]
+    flat += [outs[s][1].reshape(-1, 4) for s in _DET_STRIDES]
+    flat += [outs[s][2].reshape(-1, 10) for s in _DET_STRIDES]
+    return flat
+
+
+class _FakeNodeArg:
+    name = "input.1"
+    type = "tensor(float)"
+    shape: list[object] = ["batch", 3, _DET_INPUT, _DET_INPUT]
+
+
+class _FakeBatchedSession:
+    """Stands in for an ORT session over the re-exported [N,3,640,640] graph."""
+
+    def __init__(self, responses: list[list[np.ndarray]]) -> None:
+        self._responses = responses
+        self.run_batch_sizes: list[int] = []
+
+    def get_inputs(self) -> list[_FakeNodeArg]:
+        return [_FakeNodeArg()]
+
+    def run(self, output_names: list[str], feed: dict[str, np.ndarray]) -> list[np.ndarray]:
+        blob = next(iter(feed.values()))
+        assert blob.shape[1:] in ((3, _DET_INPUT, _DET_INPUT), (_DET_INPUT, _DET_INPUT, 3))
+        self.run_batch_sizes.append(blob.shape[0])
+        response = self._responses.pop(0)
+        assert response[0].shape[0] == blob.shape[0] * _stride_anchor_count(8), (
+            "crafted batch size must match the fed blob"
+        )
+        return response
+
+
+def _make_batched_det_model(responses: list[list[np.ndarray]]) -> object:
+    import types
+    from types import SimpleNamespace
+
+    from insightface.model_zoo.scrfd import SCRFD
+
+    det_model = SimpleNamespace(
+        session=_FakeBatchedSession(responses),
+        input_size=(_DET_INPUT, _DET_INPUT),
+        input_mean=127.5,
+        input_std=128.0,
+        input_name="input.1",
+        output_names=[f"out_{i}" for i in range(9)],
+        fmc=3,
+        _feat_stride_fpn=_DET_STRIDES,
+        _num_anchors=_DET_ANCHORS_PER_CELL,
+        use_kps=True,
+        det_thresh=0.5,
+        nms_thresh=0.4,
+    )
+    det_model.nms = types.MethodType(SCRFD.nms, det_model)
+    return det_model
+
+
+def _create_batched_provider(
+    responses: list[list[np.ndarray]], **provider_kwargs: object
+) -> tuple[InsightFaceProvider, MagicMock]:
+    provider = InsightFaceProvider(use_gpu=False, det_size=(_DET_INPUT, _DET_INPUT), **provider_kwargs)  # type: ignore[arg-type]
+    mock_app = MagicMock()
+    mock_app.det_model = _make_batched_det_model(responses)
+    mock_rec = MagicMock()
+    mock_rec.input_size = (112, 112)
+    mock_rec.get_feat.return_value = np.random.randn(2, 512).astype(np.float32)
+    mock_app.models = {"recognition": mock_rec}
+    provider._app = mock_app
+    provider._loaded = True
+    return provider, mock_app
+
+
+class TestBatchedDetection:
+    """The 100x100 test image letterboxes onto the 640 canvas with
+    det_scale = 6.4, so a face at canvas bbox (64, 128, 384, 448) decodes to
+    (10, 20, 60, 70) in original image coordinates."""
+
+    def test_detect_batch_single_session_run(self) -> None:
+        responses = [
+            _craft_scrfd_net_outs(
+                [
+                    [((64.0, 128.0, 384.0, 448.0), 0.9)],
+                    [((128.0, 192.0, 256.0, 320.0), 0.8)],
+                ]
+            )
+        ]
+        provider, mock_app = _create_batched_provider(responses)
+
+        results = provider.detect_batch([_fake_image_bytes(), _fake_image_bytes()])
+
+        session = mock_app.det_model.session
+        assert session.run_batch_sizes == [2]
+        assert len(results) == 2
+        f0, f1 = results[0][0], results[1][0]
+        assert f0.bbox.x == pytest.approx(10.0, abs=0.05)
+        assert f0.bbox.y == pytest.approx(20.0, abs=0.05)
+        assert f0.bbox.width == pytest.approx(50.0, abs=0.1)
+        assert f0.bbox.height == pytest.approx(50.0, abs=0.1)
+        assert f0.det_score == pytest.approx(0.9, rel=1e-3)
+        assert f0.landmarks is not None
+        assert f0.landmarks[0][0] == pytest.approx(35.0, abs=0.05)
+        assert f0.landmarks[0][1] == pytest.approx(45.0, abs=0.05)
+        assert f1.bbox.x == pytest.approx(20.0, abs=0.05)
+        assert f1.bbox.y == pytest.approx(30.0, abs=0.05)
+        assert f1.det_score == pytest.approx(0.8, rel=1e-3)
+
+    def test_detect_batch_chunked_by_det_trt_max_batch(self) -> None:
+        face = [((64.0, 128.0, 384.0, 448.0), 0.9)]
+        responses = [_craft_scrfd_net_outs([face]), _craft_scrfd_net_outs([face])]
+        provider, mock_app = _create_batched_provider(responses, det_trt_max_batch=1)
+
+        results = provider.detect_batch([_fake_image_bytes(), _fake_image_bytes()])
+
+        assert mock_app.det_model.session.run_batch_sizes == [1, 1]
+        assert len(results) == 2
+        assert len(results[0]) == 1
+        assert len(results[1]) == 1
+
+    def test_pad_fallback_is_second_batched_pass_over_misses(self) -> None:
+        # Image 1 hits on the first pass; image 2 misses and hits on the
+        # padded (300x300 -> det_scale 640/300) retry. The retry pass must be
+        # one batched run over just the misses, and its coordinates must come
+        # back translated into the original 100x100 frame.
+        pad_scale = 640.0 / 300.0
+        padded_bbox = (110.0 * pad_scale, 120.0 * pad_scale, 180.0 * pad_scale, 190.0 * pad_scale)
+        responses = [
+            _craft_scrfd_net_outs([[((64.0, 128.0, 384.0, 448.0), 0.9)], []]),
+            _craft_scrfd_net_outs([[(padded_bbox, 0.85)]]),
+        ]
+        provider, mock_app = _create_batched_provider(responses)
+
+        results = provider.detect_batch([_fake_image_bytes(), _fake_image_bytes()])
+
+        assert mock_app.det_model.session.run_batch_sizes == [2, 1]
+        assert len(results[0]) == 1
+        assert len(results[1]) == 1
+        # Padded-space (110, 120, 180, 190) minus the (100, 100) pad offset.
+        assert results[1][0].bbox.x == pytest.approx(10.0, abs=0.05)
+        assert results[1][0].bbox.y == pytest.approx(20.0, abs=0.05)
+        assert results[1][0].bbox.width == pytest.approx(70.0, abs=0.1)
+        assert results[1][0].bbox.height == pytest.approx(70.0, abs=0.1)
+
+    def test_embed_batch_uses_batched_detection(self) -> None:
+        responses = [
+            _craft_scrfd_net_outs(
+                [
+                    [((64.0, 128.0, 384.0, 448.0), 0.9)],
+                    [((128.0, 192.0, 256.0, 320.0), 0.8)],
+                ]
+            )
+        ]
+        provider, mock_app = _create_batched_provider(responses)
+
+        results = provider.embed_batch([_fake_image_bytes(), _fake_image_bytes()])
+
+        assert mock_app.det_model.session.run_batch_sizes == [2]
+        assert len(results) == 2
+        assert results[0][0].embedding is not None
+        assert len(results[0][0].embedding) == 512
+        assert results[1][0].embedding is not None
+
+    def test_undecodable_image_gets_empty_entry_without_detector_run(self) -> None:
+        responses = [_craft_scrfd_net_outs([[((64.0, 128.0, 384.0, 448.0), 0.9)]])]
+        provider, mock_app = _create_batched_provider(responses)
+
+        results = provider.detect_batch([b"not-an-image", _fake_image_bytes()])
+
+        # Only the decodable image reaches the detector.
+        assert mock_app.det_model.session.run_batch_sizes == [1]
+        assert results[0] == []
+        assert len(results[1]) == 1
+
+    def test_single_image_detect_routes_through_batched_graph(self) -> None:
+        responses = [_craft_scrfd_net_outs([[((64.0, 128.0, 384.0, 448.0), 0.9)]])]
+        provider, mock_app = _create_batched_provider(responses)
+
+        faces = provider.detect(_fake_image_bytes())
+
+        assert mock_app.det_model.session.run_batch_sizes == [1]
+        assert len(faces) == 1
+        assert faces[0].bbox.x == pytest.approx(10.0, abs=0.05)
+
+    def test_batch_capability_probe_rejects_mocked_session(self) -> None:
+        provider, _mock_app = _create_provider_with_mock()
+        assert provider._det_batch_capable() is False
+
+
+class TestUint8DetectorInput:
+    def test_uint8_graph_gets_raw_uint8_canvases(self) -> None:
+        responses = [_craft_scrfd_net_outs([[((64.0, 128.0, 384.0, 448.0), 0.9)]])]
+        provider, mock_app = _create_batched_provider(responses)
+        session = mock_app.det_model.session
+        u8_arg_cls = type("N", (), {"name": "input_u8", "shape": ["batch", _DET_INPUT, _DET_INPUT, 3]})
+        u8_arg = u8_arg_cls()
+        u8_arg.type = "tensor(uint8)"
+        session.get_inputs = lambda: [u8_arg]
+        fed: list[np.ndarray] = []
+        original_run = session.run
+        session.run = lambda names, feed: (fed.append(next(iter(feed.values()))), original_run(names, feed))[1]
+
+        faces = provider.detect(_fake_image_bytes())
+
+        assert len(fed) == 1
+        assert fed[0].dtype == np.uint8
+        assert fed[0].shape == (1, _DET_INPUT, _DET_INPUT, 3)  # NHWC
+        assert len(faces) == 1
+        assert faces[0].bbox.x == pytest.approx(10.0, abs=0.05)
+
+    def test_float_graph_gets_float_blob(self) -> None:
+        responses = [_craft_scrfd_net_outs([[((64.0, 128.0, 384.0, 448.0), 0.9)]])]
+        provider, mock_app = _create_batched_provider(responses)
+        session = mock_app.det_model.session
+        fed: list[np.ndarray] = []
+        original_run = session.run
+        session.run = lambda names, feed: (fed.append(next(iter(feed.values()))), original_run(names, feed))[1]
+
+        provider.detect(_fake_image_bytes())
+
+        assert fed[0].dtype == np.float32
+
+
+class _FakeGaSession:
+    def __init__(self) -> None:
+        self.run_batch_sizes: list[int] = []
+
+    def get_inputs(self) -> list[object]:
+        arg = type("N", (), {"name": "data", "shape": ["None", 3, 96, 96]})()
+        return [arg]
+
+    def run(self, output_names: list[str], feed: dict[str, np.ndarray]) -> list[np.ndarray]:
+        blob = next(iter(feed.values()))
+        assert blob.shape[1:] == (3, 96, 96)
+        assert blob.dtype == np.float32
+        self.run_batch_sizes.append(blob.shape[0])
+        # pred = [female_logit, male_logit, age/100]: alternate male 30 / female 25
+        preds = np.zeros((blob.shape[0], 3), dtype=np.float32)
+        for i in range(blob.shape[0]):
+            if i % 2 == 0:
+                preds[i] = [0.1, 0.9, 0.30]
+            else:
+                preds[i] = [0.9, 0.1, 0.25]
+        return [preds]
+
+
+def _make_batched_ga_model() -> object:
+    from types import SimpleNamespace
+
+    return SimpleNamespace(
+        taskname="genderage",
+        session=_FakeGaSession(),
+        input_size=(96, 96),
+        input_mean=127.5,
+        input_std=128.0,
+        input_name="data",
+        output_names=["fc1"],
+    )
+
+
+class TestBatchedGenderage:
+    def test_analyze_batch_runs_genderage_once_for_all_faces(self) -> None:
+        responses = [
+            _craft_scrfd_net_outs(
+                [
+                    [((64.0, 128.0, 384.0, 448.0), 0.9)],
+                    [((128.0, 192.0, 256.0, 320.0), 0.8)],
+                ]
+            )
+        ]
+        provider, mock_app = _create_batched_provider(responses)
+        ga = _make_batched_ga_model()
+        mock_app.models["genderage"] = ga
+
+        results = provider.analyze_batch([_fake_image_bytes(), _fake_image_bytes()])
+
+        assert ga.session.run_batch_sizes == [2]
+        assert results[0][0].gender == "male"
+        assert results[0][0].age == 30.0
+        assert results[1][0].gender == "female"
+        assert results[1][0].age == 25.0
+        assert results[0][0].embedding is not None
+
+    def test_analyze_single_image_uses_batched_genderage(self) -> None:
+        responses = [_craft_scrfd_net_outs([[((64.0, 128.0, 384.0, 448.0), 0.9)]])]
+        provider, mock_app = _create_batched_provider(responses)
+        mock_rec = mock_app.models["recognition"]
+        mock_rec.get_feat.return_value = np.random.randn(1, 512).astype(np.float32)
+        ga = _make_batched_ga_model()
+        mock_app.models["genderage"] = ga
+
+        faces = provider.analyze(_fake_image_bytes())
+
+        assert ga.session.run_batch_sizes == [1]
+        assert faces[0].gender == "male"
+        assert faces[0].age == 30.0
+
+    def test_mocked_ga_model_falls_back_to_per_face_get(self) -> None:
+        # A MagicMock genderage model (no real taskname) must keep the legacy
+        # per-face Attribute.get path — this is what the older tests exercise.
+        provider, mock_app = _create_provider_with_mock()
+        mock_ga = MagicMock()
+
+        def fake_ga_get(img: object, face: object) -> tuple[int, int]:
+            face["gender"] = 1  # type: ignore[index]
+            face["age"] = 40
+            return 1, 40
+
+        mock_ga.get.side_effect = fake_ga_get
+        mock_app.models["genderage"] = mock_ga
+
+        faces = provider.analyze(_fake_image_bytes())
+        assert faces[0].gender == "male"
+        assert faces[0].age == 40.0
+        mock_ga.get.assert_called_once()
+
+    def test_ga_crop_matches_insightface_transform(self) -> None:
+        from insightface.utils import face_align
+
+        rng = np.random.default_rng(3)
+        img = rng.integers(0, 255, size=(200, 200, 3), dtype=np.uint8)
+        bbox = np.array([40.0, 50.0, 120.0, 160.0], dtype=np.float32)
+
+        ours = InsightFaceProvider._ga_crop(img, bbox, 96)
+
+        w, h = bbox[2] - bbox[0], bbox[3] - bbox[1]
+        center = ((bbox[0] + bbox[2]) / 2, (bbox[1] + bbox[3]) / 2)
+        scale = 96 / (max(w, h) * 1.5)
+        theirs, _ = face_align.transform(img, center, 96, scale, 0)
+
+        np.testing.assert_allclose(ours.astype(np.int16), theirs.astype(np.int16), atol=1)
+
+
+class _FakeComputeSession:
+    """Thread-safe fake detector session: derives the response from the fed
+    blob's batch size instead of a pre-queued list, so concurrent requests can
+    hit it in any order. Every image "contains" the same single face."""
+
+    _FACE = ((64.0, 128.0, 384.0, 448.0), 0.9)
+
+    def __init__(self) -> None:
+        import threading
+
+        self._lock = threading.Lock()
+        self.run_count = 0
+
+    def get_inputs(self) -> list[_FakeNodeArg]:
+        return [_FakeNodeArg()]
+
+    def run(self, output_names: list[str], feed: dict[str, np.ndarray]) -> list[np.ndarray]:
+        blob = next(iter(feed.values()))
+        with self._lock:
+            self.run_count += 1
+        return _craft_scrfd_net_outs([[self._FACE]] * blob.shape[0])
+
+
+def _create_concurrent_provider() -> tuple[InsightFaceProvider, MagicMock]:
+    import types
+    from types import SimpleNamespace
+
+    from insightface.model_zoo.scrfd import SCRFD
+
+    provider = InsightFaceProvider(use_gpu=False, det_size=(_DET_INPUT, _DET_INPUT))
+    mock_app = MagicMock()
+    det_model = SimpleNamespace(
+        session=_FakeComputeSession(),
+        input_size=(_DET_INPUT, _DET_INPUT),
+        input_mean=127.5,
+        input_std=128.0,
+        input_name="input.1",
+        output_names=[f"out_{i}" for i in range(9)],
+        fmc=3,
+        _feat_stride_fpn=_DET_STRIDES,
+        _num_anchors=_DET_ANCHORS_PER_CELL,
+        use_kps=True,
+        det_thresh=0.5,
+        nms_thresh=0.4,
+    )
+    det_model.nms = types.MethodType(SCRFD.nms, det_model)
+    mock_app.det_model = det_model
+    mock_rec = MagicMock()
+    mock_rec.input_size = (112, 112)
+    mock_rec.get_feat.side_effect = lambda crops: np.random.randn(len(crops), 512).astype(np.float32)
+    mock_app.models = {"recognition": mock_rec, "genderage": _make_batched_ga_model()}
+    provider._app = mock_app
+    provider._loaded = True
+    return provider, mock_app
+
+
+class TestConcurrentInference:
+    """FACE_MAX_INFLIGHT > 1 lets several requests run provider methods from
+    different threads; the internal GPU lock must keep results correct."""
+
+    def test_concurrent_detect_batch_threads(self) -> None:
+        from concurrent.futures import ThreadPoolExecutor as TestPool
+
+        provider, mock_app = _create_concurrent_provider()
+        payload = [_fake_image_bytes(), _fake_image_bytes()]
+
+        with TestPool(max_workers=3) as pool:
+            all_results = list(pool.map(lambda _: provider.detect_batch(payload), range(3)))
+
+        assert mock_app.det_model.session.run_count == 3  # one batched pass per request
+        for results in all_results:
+            assert len(results) == 2
+            for faces in results:
+                assert len(faces) == 1
+                assert faces[0].bbox.x == pytest.approx(10.0, abs=0.05)
+                assert faces[0].det_score == pytest.approx(0.9, rel=1e-3)
+
+    def test_concurrent_mixed_operations(self) -> None:
+        from concurrent.futures import ThreadPoolExecutor as TestPool
+
+        provider, mock_app = _create_concurrent_provider()
+        payload = [_fake_image_bytes(), _fake_image_bytes()]
+
+        with TestPool(max_workers=2) as pool:
+            analyze_future = pool.submit(provider.analyze_batch, payload)
+            detect_future = pool.submit(provider.detect_batch, payload)
+            analyzed = analyze_future.result()
+            detected = detect_future.result()
+
+        assert len(analyzed) == 2
+        assert analyzed[0][0].embedding is not None
+        assert analyzed[0][0].gender in ("male", "female")
+        assert len(detected) == 2
+        assert detected[0][0].embedding is None
+        assert detected[0][0].bbox.x == pytest.approx(10.0, abs=0.05)
+
+
+class TestDynamicBatchRollback:
+    @patch("insightface.app.FaceAnalysis", autospec=False)
+    def test_disabling_flag_restores_stock_graph_from_bak(self, mock_fa_cls: MagicMock, tmp_path: object) -> None:
+        import pathlib
+
+        mock_fa_cls.return_value = MagicMock()
+        pack_dir = pathlib.Path(str(tmp_path)) / "models" / "buffalo_l"
+        pack_dir.mkdir(parents=True)
+        det_path = pack_dir / "det_10g.onnx"
+        det_path.write_bytes(b"converted-graph")
+        (pack_dir / "det_10g.onnx.bak").write_bytes(b"stock-graph")
+
+        provider = InsightFaceProvider(use_gpu=False, model_dir=str(tmp_path), det_dynamic_batch=False)
+        provider.load_model()
+
+        assert det_path.read_bytes() == b"stock-graph"
+        assert not (pack_dir / "det_10g.onnx.bak").exists()
+
+    @patch("insightface.app.FaceAnalysis", autospec=False)
+    def test_disabling_flag_is_noop_without_bak(self, mock_fa_cls: MagicMock, tmp_path: object) -> None:
+        import pathlib
+
+        mock_fa_cls.return_value = MagicMock()
+        pack_dir = pathlib.Path(str(tmp_path)) / "models" / "buffalo_l"
+        pack_dir.mkdir(parents=True)
+        (pack_dir / "det_10g.onnx").write_bytes(b"stock-graph")
+
+        provider = InsightFaceProvider(use_gpu=False, model_dir=str(tmp_path), det_dynamic_batch=False)
+        provider.load_model()
+
+        assert (pack_dir / "det_10g.onnx").read_bytes() == b"stock-graph"
+
+
+class TestTrtProfileGating:
+    @staticmethod
+    def _make_model(path: str, spatial: tuple[int, int]) -> None:
+        import onnx
+        from onnx import TensorProto, helper
+
+        h, w = spatial
+        inp = helper.make_tensor_value_info("input.1", TensorProto.FLOAT, ["batch", 3, h, w])
+        out = helper.make_tensor_value_info("y", TensorProto.FLOAT, ["batch", 3, h, w])
+        relu = helper.make_node("Relu", ["input.1"], ["y"])
+        graph = helper.make_graph([relu], "m", [inp], [out])
+        onnx.save(helper.make_model(graph, opset_imports=[helper.make_opsetid("", 11)]), path)
+
+    def test_shared_knob_disabled_keeps_detector_profile(self, tmp_path: object) -> None:
+        from src.services.face_provider.insightface import _trt_batch_profile
+
+        det_path = f"{tmp_path}/det.onnx"
+        self._make_model(det_path, (640, 640))
+        profile = _trt_batch_profile(
+            det_path, opt_batch=16, max_batch=0, det_static_dims="3x640x640", det_opt_batch=8, det_max_batch=32
+        )
+        assert profile["trt_profile_max_shapes"] == "input.1:32x3x640x640"
+
+    def test_shared_knob_disabled_skips_recognition_profile(self, tmp_path: object) -> None:
+        from src.services.face_provider.insightface import _trt_batch_profile
+
+        rec_path = f"{tmp_path}/rec.onnx"
+        self._make_model(rec_path, (112, 112))
+        profile = _trt_batch_profile(
+            rec_path, opt_batch=16, max_batch=0, det_static_dims="3x640x640", det_opt_batch=8, det_max_batch=32
+        )
+        assert profile == {}
+
+    def test_opt_clamped_to_max(self, tmp_path: object) -> None:
+        from src.services.face_provider.insightface import _trt_batch_profile
+
+        det_path = f"{tmp_path}/det.onnx"
+        self._make_model(det_path, (640, 640))
+        profile = _trt_batch_profile(
+            det_path, opt_batch=16, max_batch=0, det_static_dims="3x640x640", det_opt_batch=8, det_max_batch=4
+        )
+        assert profile["trt_profile_opt_shapes"] == "input.1:4x3x640x640"
+
+
+class TestVectorizedNormEstimation:
+    def test_batch_matches_per_face_lstsq(self) -> None:
+        from src.services.face_provider.insightface import _estimate_norm, _estimate_norms_batch
+
+        rng = np.random.default_rng(5)
+        lmks = rng.uniform(20, 600, size=(40, 5, 2)).astype(np.float32)
+
+        batched = _estimate_norms_batch(lmks, 112)
+
+        for i in range(lmks.shape[0]):
+            single = _estimate_norm(lmks[i], 112)
+            np.testing.assert_allclose(batched[i], single, atol=1e-8)

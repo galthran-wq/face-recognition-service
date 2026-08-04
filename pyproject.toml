@@ -12,6 +12,7 @@ dependencies = [
     "numpy>=1.26,<3.0",
     "opencv-python-headless>=4.8.0",
     "onnxruntime>=1.16.0",
+    "pybase64>=1.4.3",
 ]
 
 [dependency-groups]
