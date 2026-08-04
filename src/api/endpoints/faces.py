@@ -161,8 +161,8 @@ async def _process_batch[T](
 
 @router.post("/detect/batch")
 async def detect_batch(body: DetectBatchRequest, provider: ProviderDep) -> DetectBatchResponse:
-    detect_fn = functools.partial(provider.detect, include_pose=body.pose)
-    results, total_faces = await _process_batch(body.images, detect_fn, _to_detect_schema)
+    detect_fn = functools.partial(provider.detect_batch, include_pose=body.pose)
+    results, total_faces = await _process_batch_optimized(body.images, detect_fn, _to_detect_schema)
     return DetectBatchResponse(
         results=[DetectBatchResultItem(**r) for r in results],
         total_faces=total_faces,

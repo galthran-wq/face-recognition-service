@@ -344,7 +344,14 @@ class InsightFaceProvider(FaceProvider):
         img = self._decode_image(image_bytes)
         if img is None:
             return []
+        return self._detect_decoded(img, include_pose)
 
+    def detect_batch(self, images: list[bytes], include_pose: bool = False) -> list[list[DetectedFace]]:
+        with ThreadPoolExecutor(max_workers=_BATCH_THREAD_WORKERS) as pool:
+            decoded = list(pool.map(self._decode_image, images))
+        return [[] if img is None else self._detect_decoded(img, include_pose) for img in decoded]
+
+    def _detect_decoded(self, img: np.ndarray, include_pose: bool) -> list[DetectedFace]:
         bboxes, kpss, working, dx, dy = self._detect_with_pad_fallback(img)
         if bboxes.shape[0] == 0:
             return []
