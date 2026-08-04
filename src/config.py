@@ -36,10 +36,6 @@ class Settings(BaseSettings):
     # Pad-to-square fallback for frame-filling faces missed by RetinaFace anchors.
     face_pad_fallback_border_px: int = 100
     face_pad_fallback_fill: int = 128
-    # Head pose in /faces/detect responses requires the landmark_3d_68 model. Off by
-    # default: the model is otherwise dead weight (VRAM + a lazily-initialized cuDNN
-    # session that can fail long after boot when detect traffic first arrives).
-    face_enable_pose: bool = False
 
     @field_validator("face_det_size", mode="before")
     @classmethod

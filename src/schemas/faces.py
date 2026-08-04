@@ -11,6 +11,14 @@ class BatchRequest(BaseModel):
     images: list[ImageRequest]
 
 
+class DetectRequest(ImageRequest):
+    pose: bool = False
+
+
+class DetectBatchRequest(BatchRequest):
+    pose: bool = False
+
+
 # --- Shared schemas ---
 
 

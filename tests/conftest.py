@@ -22,7 +22,7 @@ class FakeFaceProvider(FaceProvider):
     def load_model(self) -> None:
         self._loaded = True
 
-    def detect(self, image_bytes: bytes) -> list[DetectedFace]:
+    def detect(self, image_bytes: bytes, include_pose: bool = False) -> list[DetectedFace]:
         return [DetectedFace(bbox=self._FACE.bbox, det_score=self._FACE.det_score)]
 
     def embed(self, image_bytes: bytes) -> list[DetectedFace]:
