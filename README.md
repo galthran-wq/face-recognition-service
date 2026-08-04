@@ -84,6 +84,9 @@ Set via environment variables or `.env` file (see `.env.example`):
 | `FACE_MAX_BATCH_SIZE` | `64` | Max images per batch request |
 | `FACE_USE_TENSORRT` | `false` | Enable TensorRT EP with FP16 (GPU only) |
 | `FACE_TRT_CACHE_PATH` | `/models/trt_cache` | TRT engine cache directory |
+| `FACE_DET_DYNAMIC_BATCH` | `true` | Re-export SCRFD with a dynamic batch dim at startup (original kept as `.onnx.bak`) |
+| `FACE_DET_TRT_MAX_BATCH` | `32` | Detector TRT profile max batch; batched detection is chunked to this size |
+| `FACE_DET_TRT_OPT_BATCH` | `8` | Detector TRT profile optimal batch |
 
 ## GPU Performance
 
@@ -97,7 +100,7 @@ Three optimizations reduce this to **5.8-22ms** depending on the endpoint:
 
 3. **TensorRT FP16 inference.** Enabling TensorRT Execution Provider with FP16 precision gives another **1.5-2.3x** on top. Embedding quality is unaffected (cosine similarity 0.9998+ vs FP32).
 
-We also tested batched detection (running SCRFD on multiple images at once), but it provided no benefit on GPU — SCRFD is already efficient at ~6ms per image.
+4. **Dynamic-batch detection.** The stock SCRFD graph is exported with batch fixed at 1, so every image costs one `session.run` and batch endpoints run detection in a Python loop. At startup the service re-exports the graph in place to `[N, 3, 640, 640]` (dynamic batch, static spatial dims — every image is letterboxed to `FACE_DET_SIZE` anyway; the original is kept as `.onnx.bak`). A request batch then becomes one detector pass per `FACE_DET_TRT_MAX_BATCH` chunk, and the pad-to-square retry for zero-face images becomes a second batched pass over just the misses instead of N sequential retries. The detector gets its own TRT optimization profile (`[1, FACE_DET_TRT_MAX_BATCH]`), so one cached engine covers every batch size. Batched and sequential detection are numerically equivalent (`tests/services/test_scrfd_export.py` validates the converted graph against the original; `benchmarks/benchmark_batched_det.py` compares both paths end-to-end).
 
 ### Benchmarks (RTX 4090, buffalo_l, 640x640 detection)
 

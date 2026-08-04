@@ -33,6 +33,15 @@ class Settings(BaseSettings):
     # chunked to max_batch. Set max_batch<=0 to disable profiles (legacy behavior).
     face_trt_max_batch: int = 256
     face_trt_opt_batch: int = 16
+    # Dynamic-batch SCRFD detection (issue #126). On startup the detector graph
+    # is re-exported in place with a dynamic batch dim and static det_size
+    # spatial dims (original kept as .onnx.bak), so a request batch of N images
+    # costs one session.run instead of N. Detector inputs are ~30x larger than
+    # recognition crops, so it gets its own TRT profile bounds; batched
+    # detection is also chunked to face_det_trt_max_batch per run.
+    face_det_dynamic_batch: bool = True
+    face_det_trt_max_batch: int = 32
+    face_det_trt_opt_batch: int = 8
     # Pad-to-square fallback for frame-filling faces missed by RetinaFace anchors.
     face_pad_fallback_border_px: int = 100
     face_pad_fallback_fill: int = 128

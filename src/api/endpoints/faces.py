@@ -119,46 +119,6 @@ async def analyze(body: ImageRequest, provider: ProviderDep) -> AnalyzeResponse:
     return AnalyzeResponse(faces=[_to_analyze_schema(f) for f in faces], face_count=len(faces))
 
 
-async def _process_batch[T](
-    images: list[ImageRequest],
-    method: Callable[[bytes], list[DetectedFace]],
-    to_schema: Callable[[DetectedFace], T],
-) -> tuple[list[dict[str, object]], int]:
-    if len(images) > settings.face_max_batch_size:
-        raise AppError(400, f"Batch size {len(images)} exceeds maximum of {settings.face_max_batch_size}")
-
-    decoded: list[tuple[int, bytes | None, str | None]] = []
-    for idx, item in enumerate(images):
-        try:
-            image_bytes = _decode_base64(item.image_b64)
-            decoded.append((idx, image_bytes, None))
-        except AppError as exc:
-            decoded.append((idx, None, exc.detail))
-
-    results: list[dict[str, object]] = []
-    total_faces = 0
-
-    async with _inference_sem:
-        for idx, raw_bytes, error in decoded:
-            if error is not None:
-                results.append({"index": idx, "faces": [], "face_count": 0, "error": error})
-                continue
-            assert raw_bytes is not None
-            try:
-                faces = await asyncio.to_thread(method, raw_bytes)
-                face_schemas = [to_schema(f) for f in faces]
-                results.append({"index": idx, "faces": face_schemas, "face_count": len(faces), "error": None})
-                total_faces += len(faces)
-            except asyncio.CancelledError:
-                raise
-            except Exception as exc:
-                logger.exception("Batch image processing failed", index=idx)
-                error_message = str(exc) or "Processing failed"
-                results.append({"index": idx, "faces": [], "face_count": 0, "error": error_message})
-
-    return results, total_faces
-
-
 @router.post("/detect/batch")
 async def detect_batch(body: DetectBatchRequest, provider: ProviderDep) -> DetectBatchResponse:
     detect_fn = functools.partial(provider.detect_batch, include_pose=body.pose)
