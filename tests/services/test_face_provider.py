@@ -91,15 +91,24 @@ class TestInsightFaceProviderDetect:
         mock_pose.get.side_effect = fake_pose_get
         mock_app.models["landmark_3d_68"] = mock_pose
 
-        faces = provider.detect(_fake_image_bytes())
+        faces = provider.detect(_fake_image_bytes(), include_pose=True)
         assert faces[0].pose is not None
         assert faces[0].pose.pitch == pytest.approx(5.0)
         assert faces[0].pose.yaw == pytest.approx(10.0)
         assert faces[0].pose.roll == pytest.approx(-3.0)
 
+    def test_detect_skips_pose_model_by_default(self) -> None:
+        provider, mock_app = _create_provider_with_mock()
+        mock_pose = MagicMock()
+        mock_app.models["landmark_3d_68"] = mock_pose
+
+        faces = provider.detect(_fake_image_bytes())
+        assert faces[0].pose is None
+        mock_pose.get.assert_not_called()
+
     def test_detect_pose_none_without_model(self) -> None:
         provider, _mock_app = _create_provider_with_mock()
-        faces = provider.detect(_fake_image_bytes())
+        faces = provider.detect(_fake_image_bytes(), include_pose=True)
         assert faces[0].pose is None
 
 

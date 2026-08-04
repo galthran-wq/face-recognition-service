@@ -1,5 +1,6 @@
 import asyncio
 import base64
+import functools
 from collections.abc import Callable
 from typing import Annotated
 
@@ -16,9 +17,11 @@ from src.schemas.faces import (
     AnalyzeResponse,
     BatchRequest,
     BoundingBoxSchema,
+    DetectBatchRequest,
     DetectBatchResponse,
     DetectBatchResultItem,
     DetectFaceSchema,
+    DetectRequest,
     DetectResponse,
     EmbedBatchResponse,
     EmbedBatchResultItem,
@@ -93,10 +96,10 @@ def _to_analyze_schema(face: DetectedFace) -> AnalyzeFaceSchema:
 
 
 @router.post("/detect")
-async def detect(body: ImageRequest, provider: ProviderDep) -> DetectResponse:
+async def detect(body: DetectRequest, provider: ProviderDep) -> DetectResponse:
     image_bytes = _decode_base64(body.image_b64)
     async with _inference_sem:
-        faces = await asyncio.to_thread(provider.detect, image_bytes)
+        faces = await asyncio.to_thread(provider.detect, image_bytes, body.pose)
     return DetectResponse(faces=[_to_detect_schema(f) for f in faces], face_count=len(faces))
 
 
@@ -157,8 +160,9 @@ async def _process_batch[T](
 
 
 @router.post("/detect/batch")
-async def detect_batch(body: BatchRequest, provider: ProviderDep) -> DetectBatchResponse:
-    results, total_faces = await _process_batch(body.images, provider.detect, _to_detect_schema)
+async def detect_batch(body: DetectBatchRequest, provider: ProviderDep) -> DetectBatchResponse:
+    detect_fn = functools.partial(provider.detect, include_pose=body.pose)
+    results, total_faces = await _process_batch(body.images, detect_fn, _to_detect_schema)
     return DetectBatchResponse(
         results=[DetectBatchResultItem(**r) for r in results],
         total_faces=total_faces,

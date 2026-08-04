@@ -340,7 +340,7 @@ class InsightFaceProvider(FaceProvider):
             poses.append(_to_pose(face_obj.get("pose")))
         return poses
 
-    def detect(self, image_bytes: bytes) -> list[DetectedFace]:
+    def detect(self, image_bytes: bytes, include_pose: bool = False) -> list[DetectedFace]:
         img = self._decode_image(image_bytes)
         if img is None:
             return []
@@ -349,7 +349,11 @@ class InsightFaceProvider(FaceProvider):
         if bboxes.shape[0] == 0:
             return []
 
-        poses = self._estimate_poses(working, bboxes, kpss)
+        poses: list[HeadPose | None]
+        if include_pose:
+            poses = self._estimate_poses(working, bboxes, kpss)
+        else:
+            poses = [None] * bboxes.shape[0]
         orig_h, orig_w = img.shape[:2]
         return [
             DetectedFace(

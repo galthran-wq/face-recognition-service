@@ -37,7 +37,7 @@ class FaceProvider(ABC):
     def load_model(self) -> None: ...
 
     @abstractmethod
-    def detect(self, image_bytes: bytes) -> list[DetectedFace]: ...
+    def detect(self, image_bytes: bytes, include_pose: bool = False) -> list[DetectedFace]: ...
 
     @abstractmethod
     def embed(self, image_bytes: bytes) -> list[DetectedFace]: ...
@@ -45,8 +45,8 @@ class FaceProvider(ABC):
     @abstractmethod
     def analyze(self, image_bytes: bytes) -> list[DetectedFace]: ...
 
-    def detect_batch(self, images: list[bytes]) -> list[list[DetectedFace]]:
-        return [self.detect(img) for img in images]
+    def detect_batch(self, images: list[bytes], include_pose: bool = False) -> list[list[DetectedFace]]:
+        return [self.detect(img, include_pose) for img in images]
 
     def embed_batch(self, images: list[bytes]) -> list[list[DetectedFace]]:
         return [self.embed(img) for img in images]
