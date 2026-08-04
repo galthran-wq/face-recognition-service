@@ -47,6 +47,10 @@ class Settings(BaseSettings):
     face_det_uint8_input: bool = True
     face_det_trt_max_batch: int = 32
     face_det_trt_opt_batch: int = 8
+    # Size of the provider's persistent CPU worker pool (JPEG decode, letterbox,
+    # crops). Decode scales near-linearly to ~16 threads on an idle host; keep
+    # instances_per_host * face_thread_workers within the core budget.
+    face_thread_workers: int = 8
     # Pad-to-square fallback for frame-filling faces missed by RetinaFace anchors.
     face_pad_fallback_border_px: int = 100
     face_pad_fallback_fill: int = 128

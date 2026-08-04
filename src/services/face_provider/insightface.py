@@ -1,14 +1,42 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from collections.abc import Callable, Sequence
 
 import cv2
 import numpy as np
 
 from src.services.face_provider.base import BoundingBox, DetectedFace, FaceProvider, HeadPose
 
-_BATCH_THREAD_WORKERS = 4
+
+class CvWorkPool:
+    """Persistent thread pool for CPU-bound cv2/numpy work.
+
+    JPEG decode, letterbox resize, warpAffine crops and blob fills all release
+    the GIL, so they thread well — but a fresh ThreadPoolExecutor per request
+    pays thread spawn/teardown on every call. This keeps one warm pool for the
+    provider's lifetime (threads are created lazily by the executor, so an
+    unused pool costs nothing). Sized via FACE_THREAD_WORKERS.
+    """
+
+    def __init__(self, workers: int) -> None:
+        self._workers = max(1, workers)
+        self._pool = ThreadPoolExecutor(max_workers=self._workers, thread_name_prefix="face-cv")
+
+    def decode_batch(
+        self, decode: Callable[[bytes], np.ndarray | None], images: list[bytes]
+    ) -> list[np.ndarray | None]:
+        """Decode a batch of encoded images (JPEG/PNG) in parallel."""
+        return self.map(decode, images)
+
+    def map(self, fn: Callable[[Any], Any], items: Sequence[Any]) -> list[Any]:
+        if len(items) <= 1:
+            return [fn(item) for item in items]
+        return list(self._pool.map(fn, items))
+
 
 # Per-image detection state: (bboxes, kpss, working_img, dx, dy, orig_h, orig_w).
 _DetResult = tuple[np.ndarray, "np.ndarray | None", "np.ndarray | None", int, int, int, int]
@@ -153,6 +181,7 @@ class InsightFaceProvider(FaceProvider):
         det_uint8_input: bool = True,
         det_trt_max_batch: int = 32,
         det_trt_opt_batch: int = 8,
+        thread_workers: int = 8,
         pad_fallback_border_px: int = 100,
         pad_fallback_fill: int = 128,
     ) -> None:
@@ -171,6 +200,7 @@ class InsightFaceProvider(FaceProvider):
         self._det_trt_opt_batch = det_trt_opt_batch
         self._pad_border_px = pad_fallback_border_px
         self._pad_fill = pad_fallback_fill
+        self._cv_pool = CvWorkPool(thread_workers)
         self._det_center_cache: dict[int, np.ndarray] = {}
         self._app: Any = None
 
@@ -477,11 +507,7 @@ class InsightFaceProvider(FaceProvider):
                 blob[i] = img_blob[0]
             det_scales[i] = det_scale
 
-        if n > 1:
-            with ThreadPoolExecutor(max_workers=_BATCH_THREAD_WORKERS) as pool:
-                list(pool.map(_fill, range(n)))
-        else:
-            _fill(0)
+        self._cv_pool.map(_fill, range(n))
 
         max_b = self._det_trt_max_batch if self._det_trt_max_batch > 0 else n
         results: list[tuple[np.ndarray, np.ndarray | None]] = []
@@ -619,11 +645,7 @@ class InsightFaceProvider(FaceProvider):
                 swapRB=True,
             )[0]
 
-        if n > 1:
-            with ThreadPoolExecutor(max_workers=_BATCH_THREAD_WORKERS) as pool:
-                list(pool.map(_fill, range(n)))
-        elif n == 1:
-            _fill(0)
+        self._cv_pool.map(_fill, range(n))
 
         max_b = self._trt_max_batch if self._trt_max_batch > 0 else n
         results: list[tuple[float | None, str | None]] = []
@@ -776,8 +798,7 @@ class InsightFaceProvider(FaceProvider):
 
     def detect_batch(self, images: list[bytes], include_pose: bool = False) -> list[list[DetectedFace]]:
         # Stage 1: Decode images in parallel (cv2.imdecode releases the GIL)
-        with ThreadPoolExecutor(max_workers=_BATCH_THREAD_WORKERS) as pool:
-            decoded = list(pool.map(self._decode_image, images))
+        decoded = self._cv_pool.decode_batch(self._decode_image, images)
 
         # Stage 2: One batched detection pass, plus one batched pad-retry pass
         # over the zero-face subset.
@@ -809,8 +830,7 @@ class InsightFaceProvider(FaceProvider):
         image_size = rec_model.input_size[0]
 
         # Stage 1: Decode images in parallel (cv2.imdecode releases the GIL)
-        with ThreadPoolExecutor(max_workers=_BATCH_THREAD_WORKERS) as pool:
-            decoded = list(pool.map(self._decode_image, images))
+        decoded = self._cv_pool.decode_batch(self._decode_image, images)
 
         # Stage 2: One batched detection pass, plus one batched pad-retry pass
         # over the zero-face subset.
@@ -830,8 +850,7 @@ class InsightFaceProvider(FaceProvider):
             crop_counts.append(it_bboxes.shape[0])
 
         if align_tasks:
-            with ThreadPoolExecutor(max_workers=_BATCH_THREAD_WORKERS) as pool:
-                all_crops = list(pool.map(lambda t: _norm_crop(t[0], t[1], image_size), align_tasks))
+            all_crops = self._cv_pool.map(lambda t: _norm_crop(t[0], t[1], image_size), align_tasks)
 
         if all_crops:
             all_embeddings: np.ndarray = self._recognize(rec_model, all_crops)
@@ -867,8 +886,7 @@ class InsightFaceProvider(FaceProvider):
         image_size = rec_model.input_size[0]
 
         # Stage 1: Decode images in parallel (cv2.imdecode releases the GIL)
-        with ThreadPoolExecutor(max_workers=_BATCH_THREAD_WORKERS) as pool:
-            decoded = list(pool.map(self._decode_image, images))
+        decoded = self._cv_pool.decode_batch(self._decode_image, images)
 
         # Stage 2: One batched detection pass, plus one batched pad-retry pass
         # over the zero-face subset.
@@ -888,8 +906,7 @@ class InsightFaceProvider(FaceProvider):
             crop_counts.append(it_bboxes.shape[0])
 
         if align_tasks:
-            with ThreadPoolExecutor(max_workers=_BATCH_THREAD_WORKERS) as pool:
-                all_crops = list(pool.map(lambda t: _norm_crop(t[0], t[1], image_size), align_tasks))
+            all_crops = self._cv_pool.map(lambda t: _norm_crop(t[0], t[1], image_size), align_tasks)
 
         if all_crops:
             all_embeddings: np.ndarray = self._recognize(rec_model, all_crops)

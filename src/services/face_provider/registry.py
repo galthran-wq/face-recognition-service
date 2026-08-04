@@ -27,6 +27,7 @@ def create_provider(settings: Settings) -> FaceProvider:
             det_uint8_input=settings.face_det_uint8_input,
             det_trt_max_batch=settings.face_det_trt_max_batch,
             det_trt_opt_batch=settings.face_det_trt_opt_batch,
+            thread_workers=settings.face_thread_workers,
             pad_fallback_border_px=settings.face_pad_fallback_border_px,
             pad_fallback_fill=settings.face_pad_fallback_fill,
         )

@@ -88,6 +88,7 @@ Set via environment variables or `.env` file (see `.env.example`):
 | `FACE_DET_UINT8_INPUT` | `true` | Bake normalization into the detector graph: uint8 input, 4x less PCIe traffic |
 | `FACE_DET_TRT_MAX_BATCH` | `32` | Detector TRT profile max batch; batched detection is chunked to this size |
 | `FACE_DET_TRT_OPT_BATCH` | `8` | Detector TRT profile optimal batch |
+| `FACE_THREAD_WORKERS` | `8` | Persistent CPU worker pool (JPEG decode, letterbox, crops) |
 
 ## GPU Performance
 

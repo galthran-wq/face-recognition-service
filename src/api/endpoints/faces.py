@@ -6,6 +6,8 @@ from typing import Annotated
 
 import structlog
 from fastapi import APIRouter, Depends
+from fastapi.responses import Response
+from pydantic import BaseModel
 
 from src.config import settings
 from src.core.exceptions import AppError
@@ -37,6 +39,16 @@ logger = structlog.get_logger()
 router = APIRouter(prefix="/faces", tags=["faces"])
 
 _inference_sem = asyncio.Semaphore(1)
+
+
+def _json_response(model: BaseModel) -> Response:
+    """Serialize via pydantic-core's Rust path and bypass FastAPI's response
+    pipeline (jsonable_encoder + json.dumps), which costs ~19x more on
+    embedding-heavy payloads (~70 ms vs ~4 ms for a 66-face batch response).
+    The `response_model` in each route decorator keeps the OpenAPI schema.
+    """
+    return Response(content=model.model_dump_json(), media_type="application/json")
+
 
 ProviderDep = Annotated[FaceProvider, Depends(get_face_provider)]
 
@@ -95,37 +107,39 @@ def _to_analyze_schema(face: DetectedFace) -> AnalyzeFaceSchema:
     )
 
 
-@router.post("/detect")
-async def detect(body: DetectRequest, provider: ProviderDep) -> DetectResponse:
+@router.post("/detect", response_model=DetectResponse)
+async def detect(body: DetectRequest, provider: ProviderDep) -> Response:
     image_bytes = _decode_base64(body.image_b64)
     async with _inference_sem:
         faces = await asyncio.to_thread(provider.detect, image_bytes, body.pose)
-    return DetectResponse(faces=[_to_detect_schema(f) for f in faces], face_count=len(faces))
+    return _json_response(DetectResponse(faces=[_to_detect_schema(f) for f in faces], face_count=len(faces)))
 
 
-@router.post("/embed")
-async def embed(body: ImageRequest, provider: ProviderDep) -> EmbedResponse:
+@router.post("/embed", response_model=EmbedResponse)
+async def embed(body: ImageRequest, provider: ProviderDep) -> Response:
     image_bytes = _decode_base64(body.image_b64)
     async with _inference_sem:
         faces = await asyncio.to_thread(provider.embed, image_bytes)
-    return EmbedResponse(faces=[_to_embed_schema(f) for f in faces], face_count=len(faces))
+    return _json_response(EmbedResponse(faces=[_to_embed_schema(f) for f in faces], face_count=len(faces)))
 
 
-@router.post("/analyze")
-async def analyze(body: ImageRequest, provider: ProviderDep) -> AnalyzeResponse:
+@router.post("/analyze", response_model=AnalyzeResponse)
+async def analyze(body: ImageRequest, provider: ProviderDep) -> Response:
     image_bytes = _decode_base64(body.image_b64)
     async with _inference_sem:
         faces = await asyncio.to_thread(provider.analyze, image_bytes)
-    return AnalyzeResponse(faces=[_to_analyze_schema(f) for f in faces], face_count=len(faces))
+    return _json_response(AnalyzeResponse(faces=[_to_analyze_schema(f) for f in faces], face_count=len(faces)))
 
 
-@router.post("/detect/batch")
-async def detect_batch(body: DetectBatchRequest, provider: ProviderDep) -> DetectBatchResponse:
+@router.post("/detect/batch", response_model=DetectBatchResponse)
+async def detect_batch(body: DetectBatchRequest, provider: ProviderDep) -> Response:
     detect_fn = functools.partial(provider.detect_batch, include_pose=body.pose)
     results, total_faces = await _process_batch_optimized(body.images, detect_fn, _to_detect_schema)
-    return DetectBatchResponse(
-        results=[DetectBatchResultItem(**r) for r in results],
-        total_faces=total_faces,
+    return _json_response(
+        DetectBatchResponse(
+            results=[DetectBatchResultItem(**r) for r in results],
+            total_faces=total_faces,
+        )
     )
 
 
@@ -173,19 +187,23 @@ async def _process_batch_optimized[T](
     return results, total_faces
 
 
-@router.post("/embed/batch")
-async def embed_batch(body: BatchRequest, provider: ProviderDep) -> EmbedBatchResponse:
+@router.post("/embed/batch", response_model=EmbedBatchResponse)
+async def embed_batch(body: BatchRequest, provider: ProviderDep) -> Response:
     results, total_faces = await _process_batch_optimized(body.images, provider.embed_batch, _to_embed_schema)
-    return EmbedBatchResponse(
-        results=[EmbedBatchResultItem(**r) for r in results],
-        total_faces=total_faces,
+    return _json_response(
+        EmbedBatchResponse(
+            results=[EmbedBatchResultItem(**r) for r in results],
+            total_faces=total_faces,
+        )
     )
 
 
-@router.post("/analyze/batch")
-async def analyze_batch(body: BatchRequest, provider: ProviderDep) -> AnalyzeBatchResponse:
+@router.post("/analyze/batch", response_model=AnalyzeBatchResponse)
+async def analyze_batch(body: BatchRequest, provider: ProviderDep) -> Response:
     results, total_faces = await _process_batch_optimized(body.images, provider.analyze_batch, _to_analyze_schema)
-    return AnalyzeBatchResponse(
-        results=[AnalyzeBatchResultItem(**r) for r in results],
-        total_faces=total_faces,
+    return _json_response(
+        AnalyzeBatchResponse(
+            results=[AnalyzeBatchResultItem(**r) for r in results],
+            total_faces=total_faces,
+        )
     )
