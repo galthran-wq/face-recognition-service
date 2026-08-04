@@ -89,6 +89,7 @@ Set via environment variables or `.env` file (see `.env.example`):
 | `FACE_DET_TRT_MAX_BATCH` | `32` | Detector TRT profile max batch; batched detection is chunked to this size |
 | `FACE_DET_TRT_OPT_BATCH` | `8` | Detector TRT profile optimal batch |
 | `FACE_THREAD_WORKERS` | `8` | Persistent CPU worker pool (JPEG decode, letterbox, crops) |
+| `FACE_MAX_INFLIGHT` | `3` | Requests processed concurrently; GPU passes stay serialized (1 = fully serial) |
 
 ## GPU Performance
 
@@ -105,6 +106,8 @@ Three optimizations reduce this to **5.8-22ms** depending on the endpoint:
 4. **Dynamic-batch detection.** The stock SCRFD graph is exported with batch fixed at 1, so every image costs one `session.run` and batch endpoints run detection in a Python loop. At startup the service re-exports the graph in place to `[N, 3, 640, 640]` (dynamic batch, static spatial dims — every image is letterboxed to `FACE_DET_SIZE` anyway; the original is kept as `.onnx.bak`). A request batch then becomes one detector pass per `FACE_DET_TRT_MAX_BATCH` chunk, and the pad-to-square retry for zero-face images becomes a second batched pass over just the misses instead of N sequential retries. The detector gets its own TRT optimization profile (`[1, FACE_DET_TRT_MAX_BATCH]`), so one cached engine covers every batch size. Batched and sequential detection are numerically equivalent (`tests/services/test_scrfd_export.py` validates the converted graph against the original; `benchmarks/benchmark_batched_det.py` compares both paths end-to-end — with TRT the outputs match exactly). Measured on a shared 4090 already running 6 live instances: with the uint8 graph + TRT FP16 the full batched detection path runs 32 images in ~70 ms (~2.2 ms/image) vs ~390 ms for the pre-batching sequential path (~5.5x); on plain CUDA EP ~300 ms vs ~700 ms (~2.3x). Expect more on an unloaded GPU.
 
 5. **Batched genderage.** `analyze` endpoints used to run the genderage model face-by-face (one `session.run` per face). All face crops of a request now go through one batched forward (chunked to `FACE_TRT_MAX_BATCH`, same TRT profile as recognition): 66 faces drop from ~48 ms to ~9 ms.
+
+6. **CPU/GPU pipelining.** The GPU is busy only ~25-30% of a request's wall time — the rest is CPU (decode, letterbox, crops, JSON). Requests used to be fully serialized, idling the GPU through every CPU stage. `FACE_MAX_INFLIGHT` (default 3) now lets several requests run their CPU stages concurrently while an internal lock keeps GPU passes serialized chunk-by-chunk, so the GPU is fed by whichever request is ready. Set to 1 to restore strictly serial behavior.
 
 ### Benchmarks (RTX 4090, buffalo_l, 640x640 detection)
 

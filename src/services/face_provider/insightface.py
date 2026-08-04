@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import threading
 from concurrent.futures import ThreadPoolExecutor
 from typing import TYPE_CHECKING, Any
 
@@ -201,6 +202,13 @@ class InsightFaceProvider(FaceProvider):
         self._pad_border_px = pad_fallback_border_px
         self._pad_fill = pad_fallback_fill
         self._cv_pool = CvWorkPool(thread_workers)
+        # Serializes GPU passes when FACE_MAX_INFLIGHT lets several requests
+        # run their CPU stages concurrently. Held only around session.run-style
+        # calls, per chunk, so requests interleave at chunk granularity.
+        # Everything else touched concurrently is safe: CvWorkPool is a
+        # thread-safe executor, _det_center_cache worst-cases a duplicate
+        # compute under the GIL, and all blobs/buffers are per-call locals.
+        self._gpu_lock = threading.Lock()
         self._det_center_cache: dict[int, np.ndarray] = {}
         self._app: Any = None
 
@@ -341,7 +349,8 @@ class InsightFaceProvider(FaceProvider):
         return cv2.imdecode(arr, cv2.IMREAD_COLOR)
 
     def _detect_faces(self, img: np.ndarray) -> tuple[np.ndarray, np.ndarray | None]:
-        bboxes, kpss = self._app.det_model.detect(img, max_num=0, metric="default")
+        with self._gpu_lock:
+            bboxes, kpss = self._app.det_model.detect(img, max_num=0, metric="default")
         return bboxes, kpss
 
     def _pad_to_square(self, img: np.ndarray) -> tuple[np.ndarray, int, int]:
@@ -513,7 +522,8 @@ class InsightFaceProvider(FaceProvider):
         results: list[tuple[np.ndarray, np.ndarray | None]] = []
         for start in range(0, n, max_b):
             chunk = blob[start : start + max_b]
-            net_outs = det_model.session.run(det_model.output_names, {det_model.input_name: chunk})
+            with self._gpu_lock:
+                net_outs = det_model.session.run(det_model.output_names, {det_model.input_name: chunk})
             for b in range(chunk.shape[0]):
                 results.append(self._decode_det_output(net_outs, b, det_scales[start + b]))
         return results
@@ -592,8 +602,12 @@ class InsightFaceProvider(FaceProvider):
         """
         max_b = self._trt_max_batch
         if max_b <= 0 or len(crops) <= max_b:
-            return rec_model.get_feat(crops)  # type: ignore[no-any-return]
-        feats = [rec_model.get_feat(crops[i : i + max_b]) for i in range(0, len(crops), max_b)]
+            with self._gpu_lock:
+                return rec_model.get_feat(crops)  # type: ignore[no-any-return]
+        feats = []
+        for i in range(0, len(crops), max_b):
+            with self._gpu_lock:
+                feats.append(rec_model.get_feat(crops[i : i + max_b]))
         return np.concatenate(feats, axis=0)
 
     @staticmethod
@@ -650,7 +664,10 @@ class InsightFaceProvider(FaceProvider):
         max_b = self._trt_max_batch if self._trt_max_batch > 0 else n
         results: list[tuple[float | None, str | None]] = []
         for start in range(0, n, max_b):
-            preds = ga_model.session.run(ga_model.output_names, {ga_model.input_name: blob[start : start + max_b]})[0]
+            with self._gpu_lock:
+                preds = ga_model.session.run(ga_model.output_names, {ga_model.input_name: blob[start : start + max_b]})[
+                    0
+                ]
             for pred in preds:
                 age = float(int(np.round(pred[2] * 100)))
                 gender = "male" if int(np.argmax(pred[:2])) == 1 else "female"
@@ -667,7 +684,8 @@ class InsightFaceProvider(FaceProvider):
         results: list[tuple[float | None, str | None]] = []
         for i in range(bboxes.shape[0]):
             face_obj = _FaceProxy(bbox=bboxes[i, :4], kps=kpss[i] if kpss is not None else None)
-            ga_model.get(working, face_obj)
+            with self._gpu_lock:
+                ga_model.get(working, face_obj)
             age = _to_float(face_obj.get("age"))
             gender_val = face_obj.get("gender")
             gender: str | None = None
@@ -707,7 +725,8 @@ class InsightFaceProvider(FaceProvider):
         poses: list[HeadPose | None] = []
         for i in range(bboxes.shape[0]):
             face_obj = _FaceProxy(bbox=bboxes[i, :4], kps=kpss[i] if kpss is not None else None)
-            pose_model.get(img, face_obj)
+            with self._gpu_lock:
+                pose_model.get(img, face_obj)
             poses.append(_to_pose(face_obj.get("pose")))
         return poses
 

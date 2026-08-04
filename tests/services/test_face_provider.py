@@ -883,3 +883,100 @@ class TestBatchedGenderage:
         theirs, _ = face_align.transform(img, center, 96, scale, 0)
 
         np.testing.assert_allclose(ours.astype(np.int16), theirs.astype(np.int16), atol=1)
+
+
+class _FakeComputeSession:
+    """Thread-safe fake detector session: derives the response from the fed
+    blob's batch size instead of a pre-queued list, so concurrent requests can
+    hit it in any order. Every image "contains" the same single face."""
+
+    _FACE = ((64.0, 128.0, 384.0, 448.0), 0.9)
+
+    def __init__(self) -> None:
+        import threading
+
+        self._lock = threading.Lock()
+        self.run_count = 0
+
+    def get_inputs(self) -> list[_FakeNodeArg]:
+        return [_FakeNodeArg()]
+
+    def run(self, output_names: list[str], feed: dict[str, np.ndarray]) -> list[np.ndarray]:
+        blob = next(iter(feed.values()))
+        with self._lock:
+            self.run_count += 1
+        return _craft_scrfd_net_outs([[self._FACE]] * blob.shape[0])
+
+
+def _create_concurrent_provider() -> tuple[InsightFaceProvider, MagicMock]:
+    import types
+    from types import SimpleNamespace
+
+    from insightface.model_zoo.scrfd import SCRFD
+
+    provider = InsightFaceProvider(use_gpu=False, det_size=(_DET_INPUT, _DET_INPUT))
+    mock_app = MagicMock()
+    det_model = SimpleNamespace(
+        session=_FakeComputeSession(),
+        input_size=(_DET_INPUT, _DET_INPUT),
+        input_mean=127.5,
+        input_std=128.0,
+        input_name="input.1",
+        output_names=[f"out_{i}" for i in range(9)],
+        fmc=3,
+        _feat_stride_fpn=_DET_STRIDES,
+        _num_anchors=_DET_ANCHORS_PER_CELL,
+        use_kps=True,
+        det_thresh=0.5,
+        nms_thresh=0.4,
+    )
+    det_model.nms = types.MethodType(SCRFD.nms, det_model)
+    mock_app.det_model = det_model
+    mock_rec = MagicMock()
+    mock_rec.input_size = (112, 112)
+    mock_rec.get_feat.side_effect = lambda crops: np.random.randn(len(crops), 512).astype(np.float32)
+    mock_app.models = {"recognition": mock_rec, "genderage": _make_batched_ga_model()}
+    provider._app = mock_app
+    provider._loaded = True
+    return provider, mock_app
+
+
+class TestConcurrentInference:
+    """FACE_MAX_INFLIGHT > 1 lets several requests run provider methods from
+    different threads; the internal GPU lock must keep results correct."""
+
+    def test_concurrent_detect_batch_threads(self) -> None:
+        from concurrent.futures import ThreadPoolExecutor as TestPool
+
+        provider, mock_app = _create_concurrent_provider()
+        payload = [_fake_image_bytes(), _fake_image_bytes()]
+
+        with TestPool(max_workers=3) as pool:
+            all_results = list(pool.map(lambda _: provider.detect_batch(payload), range(3)))
+
+        assert mock_app.det_model.session.run_count == 3  # one batched pass per request
+        for results in all_results:
+            assert len(results) == 2
+            for faces in results:
+                assert len(faces) == 1
+                assert faces[0].bbox.x == pytest.approx(10.0, abs=0.05)
+                assert faces[0].det_score == pytest.approx(0.9, rel=1e-3)
+
+    def test_concurrent_mixed_operations(self) -> None:
+        from concurrent.futures import ThreadPoolExecutor as TestPool
+
+        provider, mock_app = _create_concurrent_provider()
+        payload = [_fake_image_bytes(), _fake_image_bytes()]
+
+        with TestPool(max_workers=2) as pool:
+            analyze_future = pool.submit(provider.analyze_batch, payload)
+            detect_future = pool.submit(provider.detect_batch, payload)
+            analyzed = analyze_future.result()
+            detected = detect_future.result()
+
+        assert len(analyzed) == 2
+        assert analyzed[0][0].embedding is not None
+        assert analyzed[0][0].gender in ("male", "female")
+        assert len(detected) == 2
+        assert detected[0][0].embedding is None
+        assert detected[0][0].bbox.x == pytest.approx(10.0, abs=0.05)

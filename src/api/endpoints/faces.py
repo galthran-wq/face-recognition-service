@@ -38,7 +38,12 @@ from src.services.face_provider.base import DetectedFace, FaceProvider
 logger = structlog.get_logger()
 router = APIRouter(prefix="/faces", tags=["faces"])
 
-_inference_sem = asyncio.Semaphore(1)
+# Bounds requests in flight inside the provider. GPU passes are serialized by
+# the provider's internal lock, so with >1 permit the CPU stages of one
+# request (decode, letterbox, crops, serialization) overlap another request's
+# GPU time instead of idling behind it. FACE_MAX_INFLIGHT=1 restores strictly
+# serial behavior.
+_inference_sem = asyncio.Semaphore(settings.face_max_inflight)
 
 
 def _json_response(model: BaseModel) -> Response:
@@ -155,13 +160,19 @@ async def _process_batch_optimized[T](
     valid_bytes: list[bytes] = []
     results: list[dict[str, object]] = [{}] * len(images)
 
-    for idx, item in enumerate(images):
-        try:
-            image_bytes = _decode_base64(item.image_b64)
-            valid_indices.append(idx)
-            valid_bytes.append(image_bytes)
-        except AppError as exc:
-            results[idx] = {"index": idx, "faces": [], "face_count": 0, "error": exc.detail}
+    def _decode_all() -> None:
+        # base64 of a whole batch costs ~20+ ms — keep it off the event loop
+        # so concurrent requests aren't serialized behind it (b64decode
+        # releases the GIL).
+        for idx, item in enumerate(images):
+            try:
+                image_bytes = _decode_base64(item.image_b64)
+                valid_indices.append(idx)
+                valid_bytes.append(image_bytes)
+            except AppError as exc:
+                results[idx] = {"index": idx, "faces": [], "face_count": 0, "error": exc.detail}
+
+    await asyncio.to_thread(_decode_all)
 
     total_faces = 0
 

@@ -51,6 +51,13 @@ class Settings(BaseSettings):
     # crops). Decode scales near-linearly to ~16 threads on an idle host; keep
     # instances_per_host * face_thread_workers within the core budget.
     face_thread_workers: int = 8
+    # Requests allowed inside the provider concurrently. GPU passes stay
+    # serialized by an internal lock, so >1 lets request N+1's CPU stages
+    # (decode, letterbox, crops, serialization) overlap request N's GPU time —
+    # the GPU is busy only ~25-30% of a request otherwise. 1 restores strictly
+    # serial behavior. The CvWorkPool is shared, so inflight does not multiply
+    # the thread budget.
+    face_max_inflight: int = 3
     # Pad-to-square fallback for frame-filling faces missed by RetinaFace anchors.
     face_pad_fallback_border_px: int = 100
     face_pad_fallback_fill: int = 128
