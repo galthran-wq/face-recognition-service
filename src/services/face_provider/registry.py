@@ -24,6 +24,7 @@ def create_provider(settings: Settings) -> FaceProvider:
             trt_max_batch=settings.face_trt_max_batch,
             trt_opt_batch=settings.face_trt_opt_batch,
             det_dynamic_batch=settings.face_det_dynamic_batch,
+            det_uint8_input=settings.face_det_uint8_input,
             det_trt_max_batch=settings.face_det_trt_max_batch,
             det_trt_opt_batch=settings.face_det_trt_opt_batch,
             pad_fallback_border_px=settings.face_pad_fallback_border_px,

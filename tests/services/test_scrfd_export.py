@@ -97,9 +97,48 @@ class TestConvertScrfdToDynamicBatch:
         assert not os.path.exists(model_path + ".bak")
 
 
+class TestUint8Input:
+    def test_uint8_graph_matches_float_normalization(self, tmp_path: Path) -> None:
+        import onnxruntime as ort
+
+        model_path = str(tmp_path / "det_like.onnx")
+        _make_scrfd_like_model(model_path)
+
+        assert convert_scrfd_to_dynamic_batch(model_path, det_size=(8, 8), uint8_input=True) == "converted"
+
+        sess = ort.InferenceSession(model_path, providers=["CPUExecutionProvider"])
+        inp = sess.get_inputs()[0]
+        assert inp.name == "input_u8"
+        assert inp.type == "tensor(uint8)"
+
+        rng = np.random.default_rng(2)
+        u8 = rng.integers(0, 256, size=(2, 3, 8, 8), dtype=np.uint8)
+        (from_u8,) = sess.run(None, {"input_u8": u8})
+
+        orig = ort.InferenceSession(model_path + ".bak", providers=["CPUExecutionProvider"])
+        # blobFromImage equivalent: BGR->RGB swap + (x - 127.5) / 128
+        float_blob = (u8[:, ::-1, :, :].astype(np.float32) - 127.5) / 128.0
+        expected = np.concatenate([orig.run(None, {"input.1": float_blob[b : b + 1]})[0] for b in range(2)])
+        np.testing.assert_allclose(from_u8, expected, atol=1e-5)
+
+    def test_flag_flip_reconverts_from_backup(self, tmp_path: Path) -> None:
+        import onnxruntime as ort
+
+        model_path = str(tmp_path / "det_like.onnx")
+        _make_scrfd_like_model(model_path)
+
+        assert convert_scrfd_to_dynamic_batch(model_path, det_size=(8, 8), uint8_input=True) == "converted"
+        assert convert_scrfd_to_dynamic_batch(model_path, det_size=(8, 8), uint8_input=True) == "already_dynamic"
+        assert convert_scrfd_to_dynamic_batch(model_path, det_size=(8, 8), uint8_input=False) == "converted"
+
+        sess = ort.InferenceSession(model_path, providers=["CPUExecutionProvider"])
+        assert sess.get_inputs()[0].type == "tensor(float)"
+
+
 @pytest.mark.skipif(not _REAL_DET_MODEL.exists(), reason="det_10g.onnx not downloaded")
 class TestRealDetectorConversion:
-    def test_convert_and_validate_det_10g(self, tmp_path: Path) -> None:
+    @pytest.mark.parametrize("uint8_input", [False, True])
+    def test_convert_and_validate_det_10g(self, tmp_path: Path, uint8_input: bool) -> None:
         # The installed model may already be converted (load_model does it in
         # place, keeping the original as .bak) — always start from a batch-1 graph.
         source = _REAL_DET_MODEL.with_suffix(".onnx.bak")
@@ -107,8 +146,10 @@ class TestRealDetectorConversion:
             source = _REAL_DET_MODEL
         model_path = str(tmp_path / "det_10g.onnx")
         shutil.copy2(source, model_path)
-        if convert_scrfd_to_dynamic_batch(model_path, det_size=(640, 640)) == "already_dynamic":
+        outcome = convert_scrfd_to_dynamic_batch(model_path, det_size=(640, 640), uint8_input=uint8_input)
+        if outcome == "already_dynamic":
             pytest.skip("no batch-1 det_10g graph available to convert")
+        assert outcome == "converted"
 
         # Batched outputs must match the original graph run image-by-image.
         validate_dynamic_batch(model_path + ".bak", model_path, det_size=(640, 640), batch=2)

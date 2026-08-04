@@ -256,7 +256,7 @@ class TestInsightFaceProviderLoadModel:
 
         mock_ensure.assert_called_once_with("models", "buffalo_l", root=os.path.expanduser("~/.insightface"))
         mock_glob.assert_called_once_with("/fake/pack/det_*.onnx")
-        mock_convert.assert_called_once_with("/fake/pack/det_10g.onnx", det_size=(640, 640))
+        mock_convert.assert_called_once_with("/fake/pack/det_10g.onnx", det_size=(640, 640), uint8_input=True)
 
     @patch("insightface.app.FaceAnalysis", autospec=False)
     def test_load_model_skips_conversion_when_disabled(self, mock_fa_cls: MagicMock) -> None:
@@ -562,6 +562,7 @@ def _craft_scrfd_net_outs(
 
 class _FakeNodeArg:
     name = "input.1"
+    type = "tensor(float)"
     shape: list[object] = ["batch", 3, _DET_INPUT, _DET_INPUT]
 
 
@@ -738,3 +739,147 @@ class TestBatchedDetection:
     def test_batch_capability_probe_rejects_mocked_session(self) -> None:
         provider, _mock_app = _create_provider_with_mock()
         assert provider._det_batch_capable() is False
+
+
+class TestUint8DetectorInput:
+    def test_uint8_graph_gets_raw_uint8_canvases(self) -> None:
+        responses = [_craft_scrfd_net_outs([[((64.0, 128.0, 384.0, 448.0), 0.9)]])]
+        provider, mock_app = _create_batched_provider(responses)
+        session = mock_app.det_model.session
+        u8_arg_cls = type("N", (), {"name": "input_u8", "shape": ["batch", 3, _DET_INPUT, _DET_INPUT]})
+        u8_arg = u8_arg_cls()
+        u8_arg.type = "tensor(uint8)"
+        session.get_inputs = lambda: [u8_arg]
+        fed: list[np.ndarray] = []
+        original_run = session.run
+        session.run = lambda names, feed: (fed.append(next(iter(feed.values()))), original_run(names, feed))[1]
+
+        faces = provider.detect(_fake_image_bytes())
+
+        assert len(fed) == 1
+        assert fed[0].dtype == np.uint8
+        assert fed[0].shape == (1, 3, _DET_INPUT, _DET_INPUT)
+        assert len(faces) == 1
+        assert faces[0].bbox.x == pytest.approx(10.0, abs=0.05)
+
+    def test_float_graph_gets_float_blob(self) -> None:
+        responses = [_craft_scrfd_net_outs([[((64.0, 128.0, 384.0, 448.0), 0.9)]])]
+        provider, mock_app = _create_batched_provider(responses)
+        session = mock_app.det_model.session
+        fed: list[np.ndarray] = []
+        original_run = session.run
+        session.run = lambda names, feed: (fed.append(next(iter(feed.values()))), original_run(names, feed))[1]
+
+        provider.detect(_fake_image_bytes())
+
+        assert fed[0].dtype == np.float32
+
+
+class _FakeGaSession:
+    def __init__(self) -> None:
+        self.run_batch_sizes: list[int] = []
+
+    def get_inputs(self) -> list[object]:
+        arg = type("N", (), {"name": "data", "shape": ["None", 3, 96, 96]})()
+        return [arg]
+
+    def run(self, output_names: list[str], feed: dict[str, np.ndarray]) -> list[np.ndarray]:
+        blob = next(iter(feed.values()))
+        assert blob.shape[1:] == (3, 96, 96)
+        assert blob.dtype == np.float32
+        self.run_batch_sizes.append(blob.shape[0])
+        # pred = [female_logit, male_logit, age/100]: alternate male 30 / female 25
+        preds = np.zeros((blob.shape[0], 3), dtype=np.float32)
+        for i in range(blob.shape[0]):
+            if i % 2 == 0:
+                preds[i] = [0.1, 0.9, 0.30]
+            else:
+                preds[i] = [0.9, 0.1, 0.25]
+        return [preds]
+
+
+def _make_batched_ga_model() -> object:
+    from types import SimpleNamespace
+
+    return SimpleNamespace(
+        taskname="genderage",
+        session=_FakeGaSession(),
+        input_size=(96, 96),
+        input_mean=127.5,
+        input_std=128.0,
+        input_name="data",
+        output_names=["fc1"],
+    )
+
+
+class TestBatchedGenderage:
+    def test_analyze_batch_runs_genderage_once_for_all_faces(self) -> None:
+        responses = [
+            _craft_scrfd_net_outs(
+                [
+                    [((64.0, 128.0, 384.0, 448.0), 0.9)],
+                    [((128.0, 192.0, 256.0, 320.0), 0.8)],
+                ]
+            )
+        ]
+        provider, mock_app = _create_batched_provider(responses)
+        ga = _make_batched_ga_model()
+        mock_app.models["genderage"] = ga
+
+        results = provider.analyze_batch([_fake_image_bytes(), _fake_image_bytes()])
+
+        assert ga.session.run_batch_sizes == [2]
+        assert results[0][0].gender == "male"
+        assert results[0][0].age == 30.0
+        assert results[1][0].gender == "female"
+        assert results[1][0].age == 25.0
+        assert results[0][0].embedding is not None
+
+    def test_analyze_single_image_uses_batched_genderage(self) -> None:
+        responses = [_craft_scrfd_net_outs([[((64.0, 128.0, 384.0, 448.0), 0.9)]])]
+        provider, mock_app = _create_batched_provider(responses)
+        mock_rec = mock_app.models["recognition"]
+        mock_rec.get_feat.return_value = np.random.randn(1, 512).astype(np.float32)
+        ga = _make_batched_ga_model()
+        mock_app.models["genderage"] = ga
+
+        faces = provider.analyze(_fake_image_bytes())
+
+        assert ga.session.run_batch_sizes == [1]
+        assert faces[0].gender == "male"
+        assert faces[0].age == 30.0
+
+    def test_mocked_ga_model_falls_back_to_per_face_get(self) -> None:
+        # A MagicMock genderage model (no real taskname) must keep the legacy
+        # per-face Attribute.get path — this is what the older tests exercise.
+        provider, mock_app = _create_provider_with_mock()
+        mock_ga = MagicMock()
+
+        def fake_ga_get(img: object, face: object) -> tuple[int, int]:
+            face["gender"] = 1  # type: ignore[index]
+            face["age"] = 40
+            return 1, 40
+
+        mock_ga.get.side_effect = fake_ga_get
+        mock_app.models["genderage"] = mock_ga
+
+        faces = provider.analyze(_fake_image_bytes())
+        assert faces[0].gender == "male"
+        assert faces[0].age == 40.0
+        mock_ga.get.assert_called_once()
+
+    def test_ga_crop_matches_insightface_transform(self) -> None:
+        from insightface.utils import face_align
+
+        rng = np.random.default_rng(3)
+        img = rng.integers(0, 255, size=(200, 200, 3), dtype=np.uint8)
+        bbox = np.array([40.0, 50.0, 120.0, 160.0], dtype=np.float32)
+
+        ours = InsightFaceProvider._ga_crop(img, bbox, 96)
+
+        w, h = bbox[2] - bbox[0], bbox[3] - bbox[1]
+        center = ((bbox[0] + bbox[2]) / 2, (bbox[1] + bbox[3]) / 2)
+        scale = 96 / (max(w, h) * 1.5)
+        theirs, _ = face_align.transform(img, center, 96, scale, 0)
+
+        np.testing.assert_allclose(ours.astype(np.int16), theirs.astype(np.int16), atol=1)

@@ -40,6 +40,11 @@ class Settings(BaseSettings):
     # recognition crops, so it gets its own TRT profile bounds; batched
     # detection is also chunked to face_det_trt_max_batch per run.
     face_det_dynamic_batch: bool = True
+    # Bake normalization into the detector graph (uint8 BGR input): no CPU
+    # float conversion and 4x less PCIe traffic per image. Requires
+    # face_det_dynamic_batch; flip off to fall back to the float-input graph
+    # (self-heals from the .onnx.bak on restart).
+    face_det_uint8_input: bool = True
     face_det_trt_max_batch: int = 32
     face_det_trt_opt_batch: int = 8
     # Pad-to-square fallback for frame-filling faces missed by RetinaFace anchors.

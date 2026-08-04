@@ -54,21 +54,65 @@ def _input_dims(model: ModelProto) -> list[Any] | None:
     return list(dims)
 
 
-def _is_dynamic_batch(model: ModelProto, det_size: tuple[int, int]) -> bool:
-    """True if the graph already has a dynamic batch and spatial dims == det_size."""
+def _is_dynamic_batch(model: ModelProto, det_size: tuple[int, int], uint8_input: bool) -> bool:
+    """True if the graph already matches the conversion target: dynamic batch,
+    spatial dims == det_size, and the requested input dtype."""
+    from onnx import TensorProto  # noqa: PLC0415
+
     dims = _input_dims(model)
     if dims is None:
         return False
+    want_elem = TensorProto.UINT8 if uint8_input else TensorProto.FLOAT
     batch, channels, height, width = dims
     return bool(
         batch.dim_value == 0
         and channels.dim_value == 3
         and height.dim_value == det_size[1]
         and width.dim_value == det_size[0]
+        and model.graph.input[0].type.tensor_type.elem_type == want_elem
     )
 
 
-def _rewrite_graph(model: ModelProto, det_size: tuple[int, int]) -> bool:
+def _prepend_uint8_preprocessing(model: ModelProto) -> None:
+    """Move normalization into the graph: replace the float NCHW input with a
+    uint8 BGR NCHW input followed by Cast -> BGR-to-RGB Gather -> Sub(mean) ->
+    Mul(1/std), reproducing cv2.dnn.blobFromImage(..., swapRB=True) exactly.
+
+    The caller then feeds letterboxed uint8 canvases directly: no CPU float
+    conversion, and 4x less data over PCIe per image.
+    """
+    import numpy as np  # noqa: PLC0415
+    from onnx import TensorProto, helper, numpy_helper  # noqa: PLC0415
+
+    graph = model.graph
+    old_input = graph.input[0]
+    old_name = old_input.name
+
+    new_input = helper.make_tensor_value_info("input_u8", TensorProto.UINT8, None)
+    new_input.type.tensor_type.shape.CopyFrom(old_input.type.tensor_type.shape)
+
+    graph.initializer.extend(
+        [
+            numpy_helper.from_array(np.array([2, 1, 0], dtype=np.int64), name="det_pre_bgr2rgb"),
+            numpy_helper.from_array(np.array(127.5, dtype=np.float32), name="det_pre_mean"),
+            numpy_helper.from_array(np.array(1.0 / 128.0, dtype=np.float32), name="det_pre_scale"),
+        ]
+    )
+    pre_nodes = [
+        helper.make_node("Cast", ["input_u8"], ["det_pre_f32"], name="det_pre_cast", to=TensorProto.FLOAT),
+        helper.make_node("Gather", ["det_pre_f32", "det_pre_bgr2rgb"], ["det_pre_rgb"], name="det_pre_swap", axis=1),
+        helper.make_node("Sub", ["det_pre_rgb", "det_pre_mean"], ["det_pre_centered"], name="det_pre_sub"),
+        # The old graph input name becomes an internal tensor feeding the
+        # original first layer untouched.
+        helper.make_node("Mul", ["det_pre_centered", "det_pre_scale"], [old_name], name="det_pre_mul"),
+    ]
+    for node in reversed(pre_nodes):
+        graph.node.insert(0, node)
+    graph.ClearField("input")
+    graph.input.append(new_input)
+
+
+def _rewrite_graph(model: ModelProto, det_size: tuple[int, int], uint8_input: bool) -> bool:
     """Apply the dynamic-batch surgery in place. Returns False if the graph
     does not look like a stock SCRFD export (in which case it is untouched)."""
     import onnx  # noqa: PLC0415
@@ -150,11 +194,16 @@ def _rewrite_graph(model: ModelProto, det_size: tuple[int, int]) -> bool:
     # buffer {1,...}". ORT re-infers shapes at session load.
     graph.ClearField("value_info")
 
+    if uint8_input:
+        _prepend_uint8_preprocessing(model)
+
     onnx.checker.check_model(model)
     return True
 
 
-def convert_scrfd_to_dynamic_batch(model_path: str, det_size: tuple[int, int] = (640, 640)) -> ConvertOutcome:
+def convert_scrfd_to_dynamic_batch(
+    model_path: str, det_size: tuple[int, int] = (640, 640), uint8_input: bool = False
+) -> ConvertOutcome:
     """Convert a SCRFD ONNX file to dynamic batch in place (atomic, with backup).
 
     Idempotent and safe to run concurrently from multiple processes sharing a
@@ -172,9 +221,9 @@ def convert_scrfd_to_dynamic_batch(model_path: str, det_size: tuple[int, int] = 
     if dims is not None and dims[0].dim_value == 0:
         # No backup and the file itself is already dynamic: nothing to redo
         # from, and re-running the rewrite needs the batch-1 original.
-        return "already_dynamic" if _is_dynamic_batch(model, det_size) else "unsupported"
+        return "already_dynamic" if _is_dynamic_batch(model, det_size, uint8_input) else "unsupported"
 
-    if not _rewrite_graph(model, det_size):
+    if not _rewrite_graph(model, det_size, uint8_input):
         return "unsupported"
 
     serialized = model.SerializeToString()
@@ -202,22 +251,32 @@ def validate_dynamic_batch(
 
     Runs the original model image-by-image and the converted model as one
     batch (rows ``[b*K:(b+1)*K]`` of each flat output belong to image ``b``);
-    raises ``AssertionError`` on any mismatch beyond ``atol``.
+    raises ``AssertionError`` on any mismatch beyond ``atol``. If the
+    converted graph takes uint8 input, random uint8 BGR canvases are fed to it
+    and the blobFromImage-equivalent float normalization to the original.
     """
     import numpy as np  # noqa: PLC0415
     import onnxruntime as ort  # type: ignore[import-untyped]  # noqa: PLC0415
 
     rng = np.random.default_rng(0)
-    blob = rng.standard_normal((batch, 3, det_size[1], det_size[0]), dtype=np.float32)
 
     orig = ort.InferenceSession(original_path, providers=["CPUExecutionProvider"])
     conv = ort.InferenceSession(converted_path, providers=["CPUExecutionProvider"])
-    input_name = orig.get_inputs()[0].name
+    orig_input = orig.get_inputs()[0].name
+    conv_input_cfg = conv.get_inputs()[0]
     output_names = [o.name for o in orig.get_outputs()]
 
-    batched_outs = conv.run(output_names, {input_name: blob})
+    conv_blob: Any
+    if conv_input_cfg.type == "tensor(uint8)":
+        conv_blob = rng.integers(0, 256, size=(batch, 3, det_size[1], det_size[0]), dtype=np.uint8)
+        blob = (conv_blob[:, ::-1, :, :].astype(np.float32) - 127.5) / 128.0
+    else:
+        blob = rng.standard_normal((batch, 3, det_size[1], det_size[0]), dtype=np.float32)
+        conv_blob = blob
+
+    batched_outs = conv.run(output_names, {conv_input_cfg.name: conv_blob})
     for b in range(batch):
-        single_outs = orig.run(output_names, {input_name: blob[b : b + 1]})
+        single_outs = orig.run(output_names, {orig_input: blob[b : b + 1]})
         for name, single, batched in zip(output_names, single_outs, batched_outs, strict=True):
             rows = single.shape[0]
             image_slice = batched[b * rows : (b + 1) * rows]
@@ -232,10 +291,11 @@ def main() -> None:
     parser.add_argument("model", help="Path to the SCRFD .onnx file (converted in place, original kept as .bak)")
     parser.add_argument("--det-size", default="640,640", help="Static spatial size W,H to bake in (default: 640,640)")
     parser.add_argument("--validate", action="store_true", help="Compare converted outputs against the original")
+    parser.add_argument("--uint8", action="store_true", help="Bake normalization into the graph (uint8 BGR input)")
     args = parser.parse_args()
 
     width, height = (int(part.strip()) for part in args.det_size.split(","))
-    outcome = convert_scrfd_to_dynamic_batch(args.model, det_size=(width, height))
+    outcome = convert_scrfd_to_dynamic_batch(args.model, det_size=(width, height), uint8_input=args.uint8)
     print(f"{args.model}: {outcome}")
     if outcome == "unsupported":
         raise SystemExit(1)

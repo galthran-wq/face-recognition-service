@@ -76,6 +76,7 @@ def main():
     ap.add_argument("--trt-cache", default="/models/trt_cache")
     ap.add_argument("--model-dir", default="~/.insightface")
     ap.add_argument("--det-max-batch", type=int, default=32)
+    ap.add_argument("--no-uint8", action="store_true", help="keep the float-input graph (FACE_DET_UINT8_INPUT=false)")
     args = ap.parse_args()
 
     provider = InsightFaceProvider(
@@ -84,6 +85,7 @@ def main():
         use_tensorrt=args.tensorrt,
         trt_cache_path=args.trt_cache,
         det_trt_max_batch=args.det_max_batch,
+        det_uint8_input=not args.no_uint8,
     )
     t0 = time.perf_counter()
     provider.load_model()
@@ -94,12 +96,25 @@ def main():
     imgs, real = load_images(args.images, args.batch_size)
     det_model = provider._app.det_model
 
+    if provider._det_input_is_uint8():
+        # The uint8 graph carries its own normalization; insightface's float
+        # blob path can't feed it, so the sequential baseline is batch-1 runs
+        # through the same batched code path.
+        print("uint8-input graph: sequential baseline = batch-1 _detect_batch calls")
+
+        def run_sequential():
+            return [provider._detect_batch([im])[0] for im in imgs]
+    else:
+
+        def run_sequential():
+            return [det_model.detect(im, max_num=0, metric="default") for im in imgs]
+
     # Warmup both paths (TRT engine build / cuDNN autotune happen here).
-    det_model.detect(imgs[0], max_num=0, metric="default")
+    run_sequential()
     provider._detect_batch(imgs)
 
     print(f"\nequivalence on {len(imgs)} images:")
-    seq_results = [det_model.detect(im, max_num=0, metric="default") for im in imgs]
+    seq_results = run_sequential()
     bat_results = provider._detect_batch(imgs)
     ok = compare(seq_results, bat_results)
     if real and not ok:
@@ -108,8 +123,7 @@ def main():
     seq_times, bat_times = [], []
     for _ in range(args.iters):
         t = time.perf_counter()
-        for im in imgs:
-            det_model.detect(im, max_num=0, metric="default")
+        run_sequential()
         seq_times.append(time.perf_counter() - t)
 
         t = time.perf_counter()

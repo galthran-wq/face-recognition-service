@@ -150,6 +150,7 @@ class InsightFaceProvider(FaceProvider):
         trt_max_batch: int = 256,
         trt_opt_batch: int = 16,
         det_dynamic_batch: bool = True,
+        det_uint8_input: bool = True,
         det_trt_max_batch: int = 32,
         det_trt_opt_batch: int = 8,
         pad_fallback_border_px: int = 100,
@@ -165,6 +166,7 @@ class InsightFaceProvider(FaceProvider):
         self._trt_max_batch = trt_max_batch
         self._trt_opt_batch = trt_opt_batch
         self._det_dynamic_batch = det_dynamic_batch
+        self._det_uint8_input = det_uint8_input
         self._det_trt_max_batch = det_trt_max_batch
         self._det_trt_opt_batch = det_trt_opt_batch
         self._pad_border_px = pad_fallback_border_px
@@ -194,8 +196,10 @@ class InsightFaceProvider(FaceProvider):
 
             pack_dir = ensure_available("models", self._model_name, root=_osp.expanduser(self._model_dir))
             for det_path in sorted(_glob.glob(_osp.join(pack_dir, "det_*.onnx"))):
-                outcome = convert_scrfd_to_dynamic_batch(det_path, det_size=self._det_size)
-                log.info("scrfd_dynamic_batch_export", model=det_path, outcome=outcome)
+                outcome = convert_scrfd_to_dynamic_batch(
+                    det_path, det_size=self._det_size, uint8_input=self._det_uint8_input
+                )
+                log.info("scrfd_dynamic_batch_export", model=det_path, outcome=outcome, uint8=self._det_uint8_input)
 
         # Monkey-patch to inject SessionOptions into all insightface ORT sessions.
         # FaceAnalysis only forwards `providers` and `provider_options` to sessions,
@@ -422,6 +426,11 @@ class InsightFaceProvider(FaceProvider):
             return det, kpss_all[order, :, :][keep, :, :]
         return det, None
 
+    def _det_input_is_uint8(self) -> bool:
+        """True if the detector graph carries its own normalization and takes
+        raw uint8 BGR NCHW canvases (see scrfd_export uint8_input)."""
+        return bool(self._app.det_model.session.get_inputs()[0].type == "tensor(uint8)")
+
     def _letterbox_blob(self, img: np.ndarray) -> tuple[np.ndarray, float]:
         """Letterbox one image and convert it to a (1, 3, H, W) network blob.
 
@@ -453,12 +462,19 @@ class InsightFaceProvider(FaceProvider):
         det_model = self._app.det_model
         n = len(imgs)
         input_w, input_h = det_model.input_size
-        blob = np.empty((n, 3, input_h, input_w), dtype=np.float32)
+        uint8_input = self._det_input_is_uint8()
+        blob = np.empty((n, 3, input_h, input_w), dtype=np.uint8 if uint8_input else np.float32)
         det_scales = [0.0] * n
 
         def _fill(i: int) -> None:
-            img_blob, det_scale = self._letterbox_blob(imgs[i])
-            blob[i] = img_blob[0]
+            if uint8_input:
+                # Normalization lives in the graph — ship the raw letterboxed
+                # canvas (uint8 CHW, 4x less PCIe than a float blob).
+                det_img, det_scale = self._letterbox(imgs[i])
+                blob[i] = det_img.transpose(2, 0, 1)
+            else:
+                img_blob, det_scale = self._letterbox_blob(imgs[i])
+                blob[i] = img_blob[0]
             det_scales[i] = det_scale
 
         if n > 1:
@@ -553,6 +569,93 @@ class InsightFaceProvider(FaceProvider):
             return rec_model.get_feat(crops)  # type: ignore[no-any-return]
         feats = [rec_model.get_feat(crops[i : i + max_b]) for i in range(0, len(crops), max_b)]
         return np.concatenate(feats, axis=0)
+
+    @staticmethod
+    def _ga_batch_capable(ga_model: Any) -> bool:
+        """True if the genderage model can take a batched forward pass: the
+        stock graph already has a dynamic batch dim (`[None,3,96,96]`), so this
+        mostly guards against test doubles and exotic model packs."""
+        if getattr(ga_model, "taskname", None) != "genderage":
+            return False
+        shape = ga_model.session.get_inputs()[0].shape
+        return (
+            isinstance(shape, (list, tuple))
+            and len(shape) == 4
+            and not isinstance(shape[0], int)
+            and isinstance(shape[2], int)
+            and isinstance(shape[3], int)
+        )
+
+    @staticmethod
+    def _ga_crop(img: np.ndarray, bbox: np.ndarray, size: int) -> np.ndarray:
+        """Center-crop a face for the genderage model — numpy equivalent of
+        insightface's face_align.transform with rotation 0 (skimage-free, and
+        cv2.warpAffine releases the GIL so it threads well)."""
+        w, h = bbox[2] - bbox[0], bbox[3] - bbox[1]
+        cx, cy = (bbox[0] + bbox[2]) / 2, (bbox[1] + bbox[3]) / 2
+        s = size / (max(w, h) * 1.5)
+        mat = np.array([[s, 0.0, size / 2 - s * cx], [0.0, s, size / 2 - s * cy]], dtype=np.float64)
+        return cv2.warpAffine(img, mat, (size, size), borderValue=0.0)
+
+    def _genderage_batch(
+        self, ga_model: Any, tasks: list[tuple[np.ndarray, np.ndarray]]
+    ) -> list[tuple[float | None, str | None]]:
+        """Run genderage over (working_img, bbox) pairs with one session.run
+        per chunk instead of one per face. Crops mirror Attribute.get exactly;
+        chunking is bounded by the shared TRT profile max (same as recognition).
+        """
+        size = ga_model.input_size[0]
+        n = len(tasks)
+        blob = np.empty((n, 3, size, size), dtype=np.float32)
+
+        def _fill(i: int) -> None:
+            img, bbox = tasks[i]
+            aimg = self._ga_crop(img, bbox, size)
+            blob[i] = cv2.dnn.blobFromImage(
+                aimg,
+                1.0 / ga_model.input_std,
+                (size, size),
+                (ga_model.input_mean, ga_model.input_mean, ga_model.input_mean),
+                swapRB=True,
+            )[0]
+
+        if n > 1:
+            with ThreadPoolExecutor(max_workers=_BATCH_THREAD_WORKERS) as pool:
+                list(pool.map(_fill, range(n)))
+        elif n == 1:
+            _fill(0)
+
+        max_b = self._trt_max_batch if self._trt_max_batch > 0 else n
+        results: list[tuple[float | None, str | None]] = []
+        for start in range(0, n, max_b):
+            preds = ga_model.session.run(ga_model.output_names, {ga_model.input_name: blob[start : start + max_b]})[0]
+            for pred in preds:
+                age = float(int(np.round(pred[2] * 100)))
+                gender = "male" if int(np.argmax(pred[:2])) == 1 else "female"
+                results.append((age, gender))
+        return results
+
+    def _genderage_for_image(
+        self, ga_model: Any, working: np.ndarray, bboxes: np.ndarray, kpss: np.ndarray | None
+    ) -> list[tuple[float | None, str | None]]:
+        """Genderage for all faces of one image: batched when the graph allows
+        it, per-face Attribute.get otherwise (also the path test doubles hit)."""
+        if self._ga_batch_capable(ga_model):
+            return self._genderage_batch(ga_model, [(working, bboxes[i, :4]) for i in range(bboxes.shape[0])])
+        results: list[tuple[float | None, str | None]] = []
+        for i in range(bboxes.shape[0]):
+            face_obj = _FaceProxy(bbox=bboxes[i, :4], kps=kpss[i] if kpss is not None else None)
+            ga_model.get(working, face_obj)
+            age = _to_float(face_obj.get("age"))
+            gender_val = face_obj.get("gender")
+            gender: str | None = None
+            if gender_val is not None:
+                try:
+                    gender = "male" if int(gender_val) == 1 else "female"  # type: ignore[call-overload]
+                except (TypeError, ValueError):
+                    gender = str(gender_val)
+            results.append((age, gender))
+        return results
 
     def _align_and_embed(self, img: np.ndarray, kpss: np.ndarray) -> np.ndarray:
         rec_model = self._app.models["recognition"]
@@ -652,35 +755,24 @@ class InsightFaceProvider(FaceProvider):
         embeddings = self._align_and_embed(working, kpss)
         ga_model = self._app.models.get("genderage")
 
+        demographics: list[tuple[float | None, str | None]]
+        if ga_model is not None:
+            demographics = self._genderage_for_image(ga_model, working, bboxes, kpss)
+        else:
+            demographics = [(None, None)] * bboxes.shape[0]
+
         orig_h, orig_w = img.shape[:2]
-        results: list[DetectedFace] = []
-        for i in range(bboxes.shape[0]):
-            age: float | None = None
-            gender: str | None = None
-
-            if ga_model is not None:
-                face_obj = _FaceProxy(bbox=bboxes[i, :4], kps=kpss[i] if kpss is not None else None)
-                ga_model.get(working, face_obj)
-                age = _to_float(face_obj.get("age"))
-                gender_val = face_obj.get("gender")
-                if gender_val is not None:
-                    try:
-                        gender = "male" if int(gender_val) == 1 else "female"  # type: ignore[call-overload]
-                    except (TypeError, ValueError):
-                        gender = str(gender_val)
-
-            results.append(
-                DetectedFace(
-                    bbox=self._make_bbox(bboxes[i, :4], dx, dy, orig_w, orig_h),
-                    det_score=float(bboxes[i, 4]),
-                    embedding=embeddings[i].astype(np.float32).tolist(),
-                    age=age,
-                    gender=gender,
-                    landmarks=self._kps_to_landmarks(kpss[i], dx, dy),
-                )
+        return [
+            DetectedFace(
+                bbox=self._make_bbox(bboxes[i, :4], dx, dy, orig_w, orig_h),
+                det_score=float(bboxes[i, 4]),
+                embedding=embeddings[i].astype(np.float32).tolist(),
+                age=demographics[i][0],
+                gender=demographics[i][1],
+                landmarks=self._kps_to_landmarks(kpss[i], dx, dy),
             )
-
-        return results
+            for i in range(bboxes.shape[0])
+        ]
 
     def detect_batch(self, images: list[bytes], include_pose: bool = False) -> list[list[DetectedFace]]:
         # Stage 1: Decode images in parallel (cv2.imdecode releases the GIL)
@@ -807,34 +899,43 @@ class InsightFaceProvider(FaceProvider):
         else:
             all_embeddings = np.zeros((0, 512), dtype=np.float32)
 
+        # Genderage across ALL faces of the request in one batched pass (one
+        # session.run per chunk instead of one per face); falls back to
+        # per-image Attribute.get when the graph can't batch. Task order
+        # mirrors the crop/embedding order, so emb_offset indexes both.
+        demographics: list[tuple[float | None, str | None]] = []
+        if ga_model is not None and all_crops:
+            if self._ga_batch_capable(ga_model):
+                ga_tasks: list[tuple[np.ndarray, np.ndarray]] = []
+                for idx, it in enumerate(per_image):
+                    it_bboxes, it_working = it[0], it[2]
+                    if crop_counts[idx] and it_working is not None:
+                        ga_tasks.extend((it_working, it_bboxes[i, :4]) for i in range(crop_counts[idx]))
+                demographics = self._genderage_batch(ga_model, ga_tasks)
+            else:
+                for idx, it in enumerate(per_image):
+                    it_bboxes, it_kpss, it_working = it[0], it[1], it[2]
+                    if crop_counts[idx] and it_working is not None:
+                        demographics.extend(
+                            self._genderage_for_image(ga_model, it_working, it_bboxes[: crop_counts[idx]], it_kpss)
+                        )
+        else:
+            demographics = [(None, None)] * len(all_crops)
+
         results: list[list[DetectedFace]] = []
         emb_offset = 0
         for idx, it in enumerate(per_image):
-            it_bboxes, it_kpss, it_working, it_dx, it_dy, it_oh, it_ow = it
+            it_bboxes, it_kpss, _, it_dx, it_dy, it_oh, it_ow = it
             n = crop_counts[idx]
             faces: list[DetectedFace] = []
             for i in range(n):
-                age: float | None = None
-                gender: str | None = None
-
-                if ga_model is not None and it_working is not None and it_kpss is not None:
-                    face_obj = _FaceProxy(bbox=it_bboxes[i, :4], kps=it_kpss[i])
-                    ga_model.get(it_working, face_obj)
-                    age = _to_float(face_obj.get("age"))
-                    gender_val = face_obj.get("gender")
-                    if gender_val is not None:
-                        try:
-                            gender = "male" if int(gender_val) == 1 else "female"  # type: ignore[call-overload]
-                        except (TypeError, ValueError):
-                            gender = str(gender_val)
-
                 faces.append(
                     DetectedFace(
                         bbox=self._make_bbox(it_bboxes[i, :4], it_dx, it_dy, it_ow, it_oh),
                         det_score=float(it_bboxes[i, 4]),
                         embedding=all_embeddings[emb_offset + i].astype(np.float32).tolist(),
-                        age=age,
-                        gender=gender,
+                        age=demographics[emb_offset + i][0],
+                        gender=demographics[emb_offset + i][1],
                         landmarks=self._kps_to_landmarks(it_kpss[i] if it_kpss is not None else None, it_dx, it_dy),
                     )
                 )
